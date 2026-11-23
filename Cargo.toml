@@ -7,6 +7,8 @@ description = "Per-app audio routing for Windows: patch any app's audio into any
 [dependencies]
 windows-core = "0.58"
 eframe = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [dependencies.windows]
 version = "0.58"
@@ -23,6 +25,7 @@ features = [
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_Devices_FunctionDiscovery",
     "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_WindowsAndMessaging",
 ]
 
 [profile.release]

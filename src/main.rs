@@ -35,6 +35,10 @@ fn main() {
         Some("route") if args.len() >= 3 => cmd_route(&args[1], &args[2], args.get(3)),
         Some("meter") if args.len() >= 2 => cmd_meter(&args[1], args.get(2)),
         Some("default") if args.len() >= 2 => cmd_default(&args[1]),
+        // Used by install.ps1 to produce the shortcut icon.
+        Some("make-icon") if args.len() >= 2 => {
+            std::fs::write(&args[1], magic_mixer::icon::ico_bytes()).map_err(|e| e.into())
+        }
         _ => usage(),
     };
     if let Err(e) = result {

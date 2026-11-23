@@ -5,5 +5,7 @@ pub mod com;
 pub mod mixer;
 pub mod outputs;
 pub mod ring;
+pub mod icon;
 pub mod routes;
+pub mod saved;
 pub mod sources;
