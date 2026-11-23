@@ -83,10 +83,11 @@ fn cmd_devices() -> Res {
     for (title, dir) in [("Playback (route outputs)", Direction::Output), ("Recording", Direction::Input)] {
         println!("{title}:");
         for d in outputs::list_devices(dir)? {
-            println!("  {} {}", if d.is_default { "*" } else { " " }, d.name);
+            let raw = if dir == Direction::Output && outputs::supports_raw(&d.id) { "  [raw]" } else { "" };
+            println!("  {} {}{raw}", if d.is_default { "*" } else { " " }, d.name);
         }
     }
-    println!("(* = Windows default)");
+    println!("(* = Windows default, [raw] = Magic Mixer plays into it unprocessed)");
     Ok(())
 }
 

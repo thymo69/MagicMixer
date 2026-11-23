@@ -115,13 +115,55 @@ fn open_device(id: &str) -> Result<IMMDevice> {
     unsafe { enumerator()?.GetDevice(&windows::core::HSTRING::from(id)) }
 }
 
+/// The masking layer, applied to every stream Magic Mixer plays: mark it as
+/// plain "Other" audio in RAW mode, so Windows applies no enhancements,
+/// effects or voice processing on the way into the device. The receiving app
+/// gets bare samples. Must be called before Initialize. Returns false if the
+/// device doesn't support RAW (the stream still plays, just not raw).
+pub fn mask_stream(client: &IAudioClient) -> bool {
+    use windows::core::Interface;
+    unsafe {
+        let Ok(c2) = client.cast::<IAudioClient2>() else { return false };
+        let props = AudioClientProperties {
+            cbSize: std::mem::size_of::<AudioClientProperties>() as u32,
+            bIsOffload: false.into(),
+            eCategory: AudioCategory_Other,
+            Options: AUDCLNT_STREAMOPTIONS_RAW,
+        };
+        if c2.SetClientProperties(&props).is_ok() {
+            return true;
+        }
+        // RAW not supported here: still set the neutral category.
+        let props = AudioClientProperties { Options: AUDCLNT_STREAMOPTIONS_NONE, ..props };
+        let _ = c2.SetClientProperties(&props);
+        false
+    }
+}
+
+/// True if `device_id` accepts RAW (unprocessed) streams from Magic Mixer.
+pub fn supports_raw(device_id: &str) -> bool {
+    unsafe {
+        let Ok(device) = open_device(device_id) else { return false };
+        let Ok(client) = device.Activate::<IAudioClient>(CLSCTX_ALL, None) else { return false };
+        if !mask_stream(&client) {
+            return false;
+        }
+        let fmt = mix_format();
+        client
+            .Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, 300_000, 0, &fmt, None)
+            .is_ok()
+    }
+}
+
 /// Play audio from `ring` to output device `device_id` until `stop` is set,
 /// applying `gain`. Blocks the calling thread.
 pub fn play_to_device(device_id: &str, ring: Arc<Ring>, gain: Arc<Gain>, stop: Arc<AtomicBool>) -> Result<()> {
+    use windows::core::Interface;
     let _com = crate::com::ComGuard::new()?;
     unsafe {
         let device = open_device(device_id)?;
         let client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
+        let raw = mask_stream(&client);
         let fmt = mix_format();
         client.Initialize(
             AUDCLNT_SHAREMODE_SHARED,
@@ -137,6 +179,13 @@ pub fn play_to_device(device_id: &str, ring: Arc<Ring>, gain: Arc<Gain>, stop: A
         client.SetEventHandle(event)?;
         let buffer_frames = client.GetBufferSize()?;
         let render: IAudioRenderClient = client.GetService()?;
+        // Never let Windows turn routed audio down when a call starts.
+        if let Ok(session) = client.GetService::<IAudioSessionControl>() {
+            if let Ok(s2) = session.cast::<IAudioSessionControl2>() {
+                let _ = s2.SetDuckingPreference(true);
+            }
+        }
+        let _ = raw;
         let channels = fmt.nChannels as usize;
         let rate = fmt.nSamplesPerSec as usize;
 
