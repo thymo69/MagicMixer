@@ -104,8 +104,11 @@ impl Route {
         let error = Arc::new(Mutex::new(None));
 
         let cap = {
-            let (ring, stop2, pid) = (ring.clone(), stop.clone(), source.pid);
-            spawn_side("capture", stop.clone(), error.clone(), move || sources::capture_app(pid, ring, stop2))
+            let (ring, stop2, pid, input) = (ring.clone(), stop.clone(), source.pid, source.input_device.clone());
+            spawn_side("capture", stop.clone(), error.clone(), move || match input {
+                Some(dev) => outputs::capture_device(&dev, ring, stop2),
+                None => sources::capture_app(pid, ring, stop2),
+            })
         };
         let play = {
             let (stop2, gain, dev) = (stop.clone(), gain.clone(), output.id.clone());

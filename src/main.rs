@@ -96,7 +96,13 @@ fn parse_gain(s: &str) -> Option<f32> {
 }
 
 fn cmd_route(app: &str, out: &str, gain: Option<&String>) -> Res {
-    let source = sources::find_app(app)?.ok_or_else(|| format!("no app matching '{app}' has audio open (try `magic-mixer apps`)"))?;
+    // An app, or failing that a mic / input device.
+    let source = match sources::find_app(app)? {
+        Some(a) => a,
+        None => outputs::find_device(app, Direction::Input)?
+            .map(|d| sources::input_source(&d.id, &d.name))
+            .ok_or_else(|| format!("no app or input matching '{app}' (try `magic-mixer apps` / `devices`)"))?,
+    };
     let output = outputs::find_device(out, Direction::Output)?
         .ok_or_else(|| format!("no playback device matching '{out}' (try `magic-mixer devices`)"))?;
     let gain = gain.and_then(|g| parse_gain(g)).unwrap_or(1.0);

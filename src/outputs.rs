@@ -227,6 +227,56 @@ pub fn play_to_device(device_id: &str, ring: Arc<Ring>, gain: Arc<Gain>, stop: A
     Ok(())
 }
 
+/// Capture a recording device (mic, headset, line in) until `stop` is set,
+/// pushing float stereo frames (see `com::mix_format`) into `ring`. Mono mics
+/// are up-mixed to stereo by WASAPI. Blocks the calling thread.
+pub fn capture_device(device_id: &str, ring: Arc<Ring>, stop: Arc<AtomicBool>) -> Result<()> {
+    let _com = crate::com::ComGuard::new()?;
+    unsafe {
+        let device = open_device(device_id)?;
+        let client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
+        let fmt = mix_format();
+        client.Initialize(
+            AUDCLNT_SHAREMODE_SHARED,
+            AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+                | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+                | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+            200_000, // 20 ms
+            0,
+            &fmt,
+            None,
+        )?;
+        let event = CreateEventW(None, false, false, None)?;
+        client.SetEventHandle(event)?;
+        let cap: IAudioCaptureClient = client.GetService()?;
+        client.Start()?;
+        let channels = fmt.nChannels as usize;
+        let mut scratch: Vec<f32> = Vec::new();
+        while !stop.load(Ordering::Relaxed) {
+            if WaitForSingleObject(event, 100) != WAIT_OBJECT_0 {
+                continue;
+            }
+            while cap.GetNextPacketSize()? > 0 {
+                let mut data: *mut u8 = std::ptr::null_mut();
+                let (mut frames, mut flags) = (0u32, 0u32);
+                cap.GetBuffer(&mut data, &mut frames, &mut flags, None, None)?;
+                let n = frames as usize * channels;
+                scratch.clear();
+                if flags & (AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0 || data.is_null() {
+                    scratch.resize(n, 0.0);
+                } else {
+                    scratch.extend_from_slice(std::slice::from_raw_parts(data as *const f32, n));
+                }
+                cap.ReleaseBuffer(frames)?;
+                ring.push(&scratch);
+            }
+        }
+        let _ = client.Stop();
+        let _ = CloseHandle(event);
+    }
+    Ok(())
+}
+
 /// Measure the level at a device for `seconds`: what arrives at a recording
 /// device, or (with `loopback`) what is being played into a playback device.
 /// Returns (peak, rms) over the whole window.

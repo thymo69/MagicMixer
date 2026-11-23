@@ -19,15 +19,37 @@ use windows::Win32::System::Threading::{
 use crate::com::mix_format;
 use crate::ring::Ring;
 
-/// One app that has an audio session open on some output device.
-#[derive(Debug, Clone)]
+/// Something a route can capture from: normally an app that has an audio
+/// session open, or (when `input_device` is set) a microphone / input device.
+#[derive(Debug, Clone, Default)]
 pub struct AppSource {
+    /// Process id; for input devices a stable synthetic id (see `input_source`).
     pub pid: u32,
+    /// Exe name for apps, device name for inputs.
     pub name: String,
     /// True if the session is currently in the "active" (playing) state.
     pub active: bool,
     /// Current peak level 0.0..1.0 (max across devices).
     pub peak: f32,
+    /// Recording device id when this source is a mic/input rather than an app.
+    pub input_device: Option<String>,
+}
+
+impl AppSource {
+    pub fn is_input(&self) -> bool {
+        self.input_device.is_some()
+    }
+}
+
+/// A mic / input device as a source. Its `pid` is a synthetic id with the top
+/// bit set (real process ids never use it), derived from the device id so it
+/// stays the same between polls.
+pub fn input_source(device_id: &str, name: &str) -> AppSource {
+    let mut h: u32 = 0x811c_9dc5; // FNV-1a
+    for b in device_id.bytes() {
+        h = (h ^ b as u32).wrapping_mul(0x0100_0193);
+    }
+    AppSource { pid: h | 0x8000_0000, name: name.to_string(), input_device: Some(device_id.to_string()), ..Default::default() }
 }
 
 /// List every app with an audio session on any active render device.
@@ -67,6 +89,7 @@ pub fn list_apps() -> Result<Vec<AppSource>> {
                     name: process_name(pid).unwrap_or_else(|| format!("pid {pid}")),
                     active: false,
                     peak: 0.0,
+                    input_device: None,
                 });
                 entry.active |= active;
                 entry.peak = entry.peak.max(peak);
@@ -145,7 +168,7 @@ pub fn list_recorders() -> Result<Vec<Recorder>> {
 impl Recorder {
     /// The recorder as a routable source (its own audio output).
     pub fn as_source(&self) -> AppSource {
-        AppSource { pid: self.pid, name: self.name.clone(), active: self.active, peak: 0.0 }
+        AppSource { pid: self.pid, name: self.name.clone(), active: self.active, ..Default::default() }
     }
 }
 
@@ -195,6 +218,7 @@ pub fn find_app(query: &str) -> Result<Option<AppSource>> {
             name,
             active: false,
             peak: 0.0,
+            input_device: None,
         })));
     }
     let q = query.to_lowercase();

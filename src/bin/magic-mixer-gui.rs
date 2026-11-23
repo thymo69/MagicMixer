@@ -35,6 +35,8 @@ struct Snapshot {
     recorders: Vec<Recorder>,
     processes: Vec<sources::ProcessInfo>,
     outputs: Vec<Device>,
+    /// Recording devices (mics, headsets, line in).
+    inputs: Vec<Device>,
     error: Option<String>,
     loaded: bool,
 }
@@ -57,9 +59,13 @@ fn spawn_poller(ctx: egui::Context) -> Arc<Mutex<Snapshot>> {
                 let apps = sources::list_apps();
                 let recs = sources::list_recorders();
                 let outs = outputs::list_devices(Direction::Output);
+                let ins = outputs::list_devices(Direction::Input);
                 {
                     let mut s = shared.lock().unwrap();
                     s.loaded = true;
+                    if let Ok(i) = ins {
+                        s.inputs = i;
+                    }
                     match (apps, recs, outs) {
                         (Ok(a), Ok(r), Ok(o)) => {
                             s.apps = a;
@@ -224,7 +230,7 @@ impl MagicMixer {
         KNOWN_RECORDING_APPS.iter().any(|k| lower.contains(k))
     }
 
-    fn build_view(&self, apps: &[AppSource], recs: &[Recorder], procs: &[sources::ProcessInfo], outs: &[Device]) -> View {
+    fn build_view(&self, apps: &[AppSource], recs: &[Recorder], procs: &[sources::ProcessInfo], outs: &[Device], ins: &[Device]) -> View {
         // "CABLE In 16ch" is the same VB-Cable as "CABLE Input" and only one of
         // the two can be used at a time, so hide it.
         let all_outputs: Vec<Device> =
@@ -251,7 +257,7 @@ impl MagicMixer {
             }
             if let Some(pid) = sources::root_process(procs, exe) {
                 if pid != std::process::id() {
-                    everyone.push(AppSource { pid, name: exe.clone(), active: false, peak: 0.0 });
+                    everyone.push(AppSource { pid, name: exe.clone(), ..Default::default() });
                 }
             }
             seen.insert(lower);
@@ -271,6 +277,18 @@ impl MagicMixer {
             } else {
                 sources.push(a.clone());
             }
+        }
+
+        // Mics / headsets / line-ins are sources too. The recording ends of
+        // virtual cables ("CABLE Output") are left out: patching them back
+        // into an output would feed the cable into itself.
+        for d in ins {
+            if outputs::feeding_output(&d.name, &all_outputs).is_some() {
+                continue;
+            }
+            let src = sources::input_source(&d.id, &d.name);
+            everyone.push(src.clone());
+            sources.push(src);
         }
 
         // A cable that feeds a recording app is shown as that app, not as an output.
@@ -427,11 +445,11 @@ fn cable(painter: &egui::Painter, a: Pos2, b: Pos2, stroke: Stroke) {
 impl eframe::App for MagicMixer {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(Duration::from_millis(60));
-        let (apps, recs, procs, outs, poll_error, loaded) = {
+        let (apps, recs, procs, outs, ins, poll_error, loaded) = {
             let s = self.snap.lock().unwrap();
-            (s.apps.clone(), s.recorders.clone(), s.processes.clone(), s.outputs.clone(), s.error.clone(), s.loaded)
+            (s.apps.clone(), s.recorders.clone(), s.processes.clone(), s.outputs.clone(), s.inputs.clone(), s.error.clone(), s.loaded)
         };
-        let view = self.build_view(&apps, &recs, &procs, &outs);
+        let view = self.build_view(&apps, &recs, &procs, &outs, &ins);
         // A connection into a cable that feeds exactly one recording app is
         // shown (and saved) as going to that app.
         for r in self.mixer.routes() {
@@ -586,7 +604,7 @@ impl eframe::App for MagicMixer {
                     // ---- Column 1: sources ----
                     ui.vertical(|ui| {
                         ui.set_width(col_w);
-                        column_header(ui, "SOURCES", "Apps playing sound");
+                        column_header(ui, "SOURCES", "Apps playing sound, microphones");
                         if loaded && view.sources.is_empty() {
                             ui.label(RichText::new("Nothing is playing yet.").weak());
                         }
@@ -594,22 +612,27 @@ impl eframe::App for MagicMixer {
                             let resp = card(ui, self.selected == Some(a.pid), color_from(a.pid), |ui| {
                                 ui.horizontal(|ui| {
                                     ui.label(RichText::new(app_label(&a.name)).strong().size(15.0));
-                                    if a.active {
+                                    if a.is_input() {
+                                        ui.label(RichText::new("mic / input").small().color(ui.visuals().weak_text_color()));
+                                    } else if a.active {
                                         ui.label(RichText::new("playing").small().color(GREEN));
                                     }
                                 });
-                                meter(ui, a.peak, ui.available_width());
+                                // Inputs show their level in Connections once routed.
+                                meter(ui, if a.is_input() { 0.0 } else { a.peak }, ui.available_width());
                             });
                             out_anchor.insert(a.pid, Pos2::new(resp.rect.right(), resp.rect.center().y));
                             if resp.clicked() {
                                 click = Some(Click::Source(a.clone()));
                             }
-                            resp.context_menu(|ui| {
-                                if ui.button("Move to Recording / effects apps").clicked() {
-                                    move_req = Some((a.name.clone(), true));
-                                    ui.close_menu();
-                                }
-                            });
+                            if !a.is_input() {
+                                resp.context_menu(|ui| {
+                                    if ui.button("Move to Recording / effects apps").clicked() {
+                                        move_req = Some((a.name.clone(), true));
+                                        ui.close_menu();
+                                    }
+                                });
+                            }
                             ui.add_space(4.0);
                         }
                         ui.add_space(6.0);
