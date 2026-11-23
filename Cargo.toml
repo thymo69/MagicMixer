@@ -1,0 +1,28 @@
+﻿[package]
+name = "magic-mixer"
+version = "0.1.0"
+edition = "2021"
+description = "Per-app audio routing for Windows: patch any app's audio into any output device."
+
+[dependencies]
+windows-core = "0.58"
+
+[dependencies.windows]
+version = "0.58"
+features = [
+    "implement",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_UI_Shell_PropertiesSystem",
+]
+
+[profile.release]
+opt-level = 3
