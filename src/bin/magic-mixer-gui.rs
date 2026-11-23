@@ -611,9 +611,19 @@ impl eframe::App for MagicMixer {
                         for a in &view.sources {
                             let resp = card(ui, self.selected == Some(a.pid), color_from(a.pid), |ui| {
                                 ui.horizontal(|ui| {
-                                    ui.label(RichText::new(app_label(&a.name)).strong().size(15.0));
                                     if a.is_input() {
-                                        ui.label(RichText::new("mic / input").small().color(ui.visuals().weak_text_color()));
+                                        // "Headset (Example Headphones)" -> "Example Headphones" + "Headset mic"
+                                        let (kind, dev) = match a.name.split_once(" (") {
+                                            Some((k, d)) => (k.to_string(), d.strip_suffix(')').unwrap_or(d).to_string()),
+                                            None => ("Input".to_string(), a.name.clone()),
+                                        };
+                                        let kind = if kind.to_lowercase().contains("mic") { kind } else { format!("{kind} mic") };
+                                        ui.add(egui::Label::new(RichText::new(dev).strong().size(15.0)).truncate());
+                                        ui.label(RichText::new(kind).small().color(ui.visuals().weak_text_color()));
+                                    } else {
+                                        ui.add(egui::Label::new(RichText::new(app_label(&a.name)).strong().size(15.0)).truncate());
+                                    }
+                                    if a.is_input() {
                                     } else if a.active {
                                         ui.label(RichText::new("playing").small().color(GREEN));
                                     }
