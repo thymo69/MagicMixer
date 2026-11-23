@@ -208,3 +208,30 @@ pub fn meter_input(device_id: &str, loopback: bool, seconds: f32) -> Result<(f32
         Ok((peak, rms))
     }
 }
+
+
+/// Make `device_id` the Windows default device for all roles (console,
+/// multimedia, communications). Uses IPolicyConfig: undocumented but stable
+/// since Windows 7 and used by the Sound control panel itself.
+pub fn set_default_device(device_id: &str) -> Result<()> {
+    use windows::core::{GUID, HRESULT, HSTRING, IUnknown, Interface, PCWSTR};
+    const CLSID_POLICY_CONFIG: GUID = GUID::from_u128(0x870af99c_171d_4f9e_af0d_e63df40c2bc9);
+    const IID_POLICY_CONFIG: GUID = GUID::from_u128(0xf8679f50_850a_41cf_9c72_430f290290c8);
+    // Vtable slot of SetDefaultEndpoint: 3 IUnknown methods + 10 before it.
+    const SET_DEFAULT_ENDPOINT: usize = 13;
+    type SetDefaultFn = unsafe extern "system" fn(*mut std::ffi::c_void, PCWSTR, ERole) -> HRESULT;
+    unsafe {
+        let unk: IUnknown = CoCreateInstance(&CLSID_POLICY_CONFIG, None, CLSCTX_ALL)?;
+        let mut cfg: *mut std::ffi::c_void = std::ptr::null_mut();
+        unk.query(&IID_POLICY_CONFIG, &mut cfg).ok()?;
+        let unk_cfg = IUnknown::from_raw(cfg); // releases on drop
+        let vtbl = *(cfg as *const *const usize);
+        let set_default: SetDefaultFn = std::mem::transmute(*vtbl.add(SET_DEFAULT_ENDPOINT));
+        let id = HSTRING::from(device_id);
+        for role in [eConsole, eMultimedia, eCommunications] {
+            set_default(cfg, PCWSTR(id.as_ptr()), role).ok()?;
+        }
+        drop(unk_cfg);
+    }
+    Ok(())
+}

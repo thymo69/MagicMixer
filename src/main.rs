@@ -21,7 +21,8 @@ fn usage() -> ! {
   magic-mixer apps
   magic-mixer devices
   magic-mixer route <app name or pid> <output device name|default> [gain%]
-  magic-mixer meter <recording device name|default> [seconds]
+  magic-mixer meter <device name|default> [seconds]
+  magic-mixer default <device name>          make a device the Windows default
 
 examples:
   magic-mixer route spotify \"CABLE Input\" 80
@@ -38,6 +39,7 @@ fn main() {
         Some("devices") => cmd_devices(),
         Some("route") if args.len() >= 3 => cmd_route(&args[1], &args[2], args.get(3)),
         Some("meter") if args.len() >= 2 => cmd_meter(&args[1], args.get(2)),
+        Some("default") if args.len() >= 2 => cmd_default(&args[1]),
         _ => usage(),
     };
     if let Err(e) = result {
@@ -140,6 +142,22 @@ fn cmd_route(app: &str, out: &str, gain: Option<&String>) -> Res {
     } else {
         Err(errors.join("; ").into())
     }
+}
+
+fn cmd_default(dev: &str) -> Res {
+    // Search playback first, then recording; an exact name match in either wins.
+    let mut found = None;
+    for dir in [Direction::Output, Direction::Input] {
+        if let Some(d) = outputs::find_device(dev, dir)? {
+            if d.name.eq_ignore_ascii_case(dev) || found.is_none() {
+                found = Some(d);
+            }
+        }
+    }
+    let d = found.ok_or_else(|| format!("no device matching '{dev}'"))?;
+    outputs::set_default_device(&d.id)?;
+    println!("Default device is now: {}", d.name);
+    Ok(())
 }
 
 fn cmd_meter(dev: &str, secs: Option<&String>) -> Res {
