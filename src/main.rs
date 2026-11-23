@@ -5,15 +5,10 @@
 //!   magic-mixer route <app> <output> [gain%] patch an app into an output device
 //!   magic-mixer meter <input> [seconds]      show the level arriving at a recording device
 
-mod com;
-mod outputs;
-mod ring;
-mod routes;
-mod sources;
-
 use std::io::BufRead;
 
-use outputs::Direction;
+use magic_mixer::outputs::{self, Direction};
+use magic_mixer::{com, mixer, sources};
 
 fn usage() -> ! {
     eprintln!(
@@ -91,7 +86,9 @@ fn cmd_route(app: &str, out: &str, gain: Option<&String>) -> Res {
 
     println!("Routing {} (pid {}) -> {} at {:.0}%", source.name, source.pid, output.name, gain * 100.0);
     println!("Type a number (0-400) for gain %, 'm' to mute/unmute, 'q' to stop.");
-    let route = routes::Route::start(source, output, gain);
+    let mut mixer = mixer::Mixer::new();
+    let id = mixer.connect(source, output, gain);
+    let route = &mixer.routes()[0];
 
     // Watch for a route thread dying so errors surface even if nobody types.
     let stdin = std::io::stdin();
@@ -105,7 +102,7 @@ fn cmd_route(app: &str, out: &str, gain: Option<&String>) -> Res {
     });
     let mut last_status = std::time::Instant::now();
     loop {
-        if route.has_failed() {
+        if route.has_stopped() {
             break;
         }
         if last_status.elapsed() >= std::time::Duration::from_secs(2) {
@@ -135,12 +132,14 @@ fn cmd_route(app: &str, out: &str, gain: Option<&String>) -> Res {
             }
         }
     }
-    let errors = route.stop();
-    if errors.is_empty() {
-        println!("Route stopped.");
-        Ok(())
-    } else {
-        Err(errors.join("; ").into())
+    let error = route.error();
+    mixer.disconnect(id);
+    match error {
+        None => {
+            println!("Route stopped.");
+            Ok(())
+        }
+        Some(e) => Err(e.into()),
     }
 }
 

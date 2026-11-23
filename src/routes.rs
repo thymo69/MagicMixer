@@ -3,7 +3,7 @@
 //! joined by a small ring buffer, so routes are fully independent of each other.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use crate::com::{CHANNELS, SAMPLE_RATE};
@@ -47,57 +47,99 @@ impl Gain {
     }
 }
 
-#[allow(dead_code)] // source/output are read by the upcoming GUI
 pub struct Route {
+    pub id: u64,
     pub source: AppSource,
     pub output: Device,
     pub gain: Arc<Gain>,
     stop: Arc<AtomicBool>,
-    threads: Vec<JoinHandle<windows::core::Result<()>>>,
+    error: Arc<Mutex<Option<String>>>,
+    threads: Vec<JoinHandle<()>>,
+}
+
+/// Run one side of a route on its own thread. If it fails, record the error
+/// and stop the other side too.
+fn spawn_side(
+    label: &'static str,
+    stop: Arc<AtomicBool>,
+    error: Arc<Mutex<Option<String>>>,
+    work: impl FnOnce() -> windows::core::Result<()> + Send + 'static,
+) -> JoinHandle<()> {
+    std::thread::Builder::new()
+        .name(label.into())
+        .spawn(move || {
+            if let Err(e) = work() {
+                error.lock().unwrap().get_or_insert_with(|| describe_error(label, &e));
+                stop.store(true, Ordering::Relaxed);
+            }
+        })
+        .expect("spawn route thread")
+}
+
+/// Turn a WASAPI error into something a non-expert can act on.
+fn describe_error(label: &str, e: &windows::core::Error) -> String {
+    let code = e.code().0 as u32;
+    let plain = match code {
+        0x8889_000A => "the device is busy (another app or device is using it exclusively)",
+        0x8889_0004 => "the device was unplugged or disabled",
+        0x8889_0008 => "the device doesn't support this audio format",
+        0x8007_0005 => "access denied",
+        0x8007_0057 if label == "capture" => "couldn't capture that app (it may have closed)",
+        _ => "",
+    };
+    if plain.is_empty() {
+        format!("{label} failed: {} (0x{code:08X})", e.message().trim())
+    } else {
+        format!("{plain} (0x{code:08X})")
+    }
 }
 
 impl Route {
     /// Start routing `source` into `output`.
-    pub fn start(source: AppSource, output: Device, gain: f32) -> Route {
+    pub fn start(id: u64, source: AppSource, output: Device, gain: f32) -> Route {
         // Cap latency at ~150 ms; anything older is dropped.
         let ring = Arc::new(Ring::new(SAMPLE_RATE as usize * CHANNELS as usize * 150 / 1000));
         let gain = Arc::new(Gain::new(gain));
         let stop = Arc::new(AtomicBool::new(false));
+        let error = Arc::new(Mutex::new(None));
 
         let cap = {
-            let (ring, stop, pid) = (ring.clone(), stop.clone(), source.pid);
-            std::thread::Builder::new()
-                .name(format!("capture-{pid}"))
-                .spawn(move || sources::capture_app(pid, ring, stop))
-                .expect("spawn capture thread")
+            let (ring, stop2, pid) = (ring.clone(), stop.clone(), source.pid);
+            spawn_side("capture", stop.clone(), error.clone(), move || sources::capture_app(pid, ring, stop2))
         };
         let play = {
-            let (ring, stop, gain, id) = (ring, stop.clone(), gain.clone(), output.id.clone());
-            std::thread::Builder::new()
-                .name("playback".into())
-                .spawn(move || outputs::play_to_device(&id, ring, gain, stop))
-                .expect("spawn playback thread")
+            let (stop2, gain, dev) = (stop.clone(), gain.clone(), output.id.clone());
+            spawn_side("playback", stop.clone(), error.clone(), move || outputs::play_to_device(&dev, ring, gain, stop2))
         };
-        Route { source, output, gain, stop, threads: vec![cap, play] }
+        Route { id, source, output, gain, stop, error, threads: vec![cap, play] }
     }
 
-    /// True if either side of the route has exited (e.g. on an error).
-    pub fn has_failed(&self) -> bool {
+    /// The first error either side hit, if any. A failed route has stopped.
+    pub fn error(&self) -> Option<String> {
+        self.error.lock().unwrap().clone()
+    }
+
+    /// True if either side of the route has exited.
+    pub fn has_stopped(&self) -> bool {
         self.threads.iter().any(|t| t.is_finished())
     }
 
-    /// Stop the route and return any error from its threads.
-    pub fn stop(self) -> Vec<String> {
+    fn shutdown(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        let labels = ["capture", "playback"];
-        self.threads
-            .into_iter()
-            .zip(labels)
-            .filter_map(|(t, label)| match t.join() {
-                Ok(Ok(())) => None,
-                Ok(Err(e)) => Some(format!("{label}: {e}")),
-                Err(_) => Some(format!("{label}: thread panicked")),
-            })
-            .collect()
+        for t in self.threads.drain(..) {
+            let _ = t.join();
+        }
+    }
+
+    /// Stop the route and return its error, if it had one.
+    pub fn stop(mut self) -> Option<String> {
+        self.shutdown();
+        self.error()
+    }
+}
+
+impl Drop for Route {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }

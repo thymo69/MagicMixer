@@ -52,7 +52,9 @@ pub fn list_apps() -> Result<Vec<AppSource>> {
                     continue;
                 }
                 let pid = ctl2.GetProcessId().unwrap_or(0);
-                if pid == 0 {
+                // Skip idle system pid 0 and ourselves: routing the mixer's
+                // own output back into itself would be a feedback loop.
+                if pid == 0 || pid == std::process::id() {
                     continue;
                 }
                 let active = ctl.GetState().map(|s| s == AudioSessionStateActive).unwrap_or(false);
