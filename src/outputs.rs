@@ -95,6 +95,22 @@ pub fn find_device(query: &str, direction: Direction) -> Result<Option<Device>> 
     Ok(devs.into_iter().find(|d| d.name.to_lowercase().contains(&q)))
 }
 
+/// For a recording device that is the far end of a virtual cable, find the
+/// playback device that feeds it: "CABLE Output (VB-Audio Virtual Cable)"
+/// is fed by "CABLE Input (VB-Audio Virtual Cable)"; likewise CABLE-A/B and
+/// other "X Output" / "X Input" pairs from the same driver.
+/// Returns None for real inputs like microphones.
+pub fn feeding_output<'a>(input_name: &str, outputs: &'a [Device]) -> Option<&'a Device> {
+    let (short, driver) = match input_name.split_once(" (") {
+        Some((s, d)) => (s, format!(" ({d}")),
+        None => (input_name, String::new()),
+    };
+    let lower = short.to_lowercase();
+    let pos = lower.rfind("output")?;
+    let want = format!("{}Input{}{}", &short[..pos], &short[pos + "output".len()..], driver).to_lowercase();
+    outputs.iter().find(|d| d.name.to_lowercase() == want)
+}
+
 fn open_device(id: &str) -> Result<IMMDevice> {
     unsafe { enumerator()?.GetDevice(&windows::core::HSTRING::from(id)) }
 }

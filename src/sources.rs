@@ -78,6 +78,112 @@ pub fn list_apps() -> Result<Vec<AppSource>> {
     Ok(apps)
 }
 
+/// An app that is recording (or has recently recorded) from an input device,
+/// e.g. Discord listening to a mic, or Ableton recording from "CABLE Output".
+#[derive(Debug, Clone)]
+pub struct Recorder {
+    pub pid: u32,
+    pub name: String,
+    /// The recording device it listens to.
+    pub input_id: String,
+    pub input_name: String,
+    pub active: bool,
+}
+
+/// List apps with audio sessions on recording devices (one entry per app and
+/// device). Expired sessions are skipped.
+pub fn list_recorders() -> Result<Vec<Recorder>> {
+    use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
+    use windows::Win32::System::Com::{CoTaskMemFree, STGM_READ};
+    let mut out: Vec<Recorder> = Vec::new();
+    unsafe {
+        let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+        let devices = enumerator.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE)?;
+        for i in 0..devices.GetCount()? {
+            let device = devices.Item(i)?;
+            let id_p = device.GetId()?;
+            let input_id = id_p.to_string().unwrap_or_default();
+            CoTaskMemFree(Some(id_p.0 as *const _));
+            let input_name = device
+                .OpenPropertyStore(STGM_READ)
+                .and_then(|s| s.GetValue(&PKEY_Device_FriendlyName))
+                .map(|v| v.to_string())
+                .unwrap_or_else(|_| input_id.clone());
+            let manager: IAudioSessionManager2 = match device.Activate(CLSCTX_ALL, None) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let sessions = manager.GetSessionEnumerator()?;
+            for j in 0..sessions.GetCount()? {
+                let ctl = sessions.GetSession(j)?;
+                let ctl2: IAudioSessionControl2 = ctl.cast()?;
+                let pid = ctl2.GetProcessId().unwrap_or(0);
+                if pid == 0 || pid == std::process::id() {
+                    continue;
+                }
+                let state = ctl.GetState().unwrap_or(AudioSessionStateExpired);
+                if state == AudioSessionStateExpired {
+                    continue;
+                }
+                if out.iter().any(|r| r.pid == pid && r.input_id == input_id) {
+                    continue;
+                }
+                out.push(Recorder {
+                    pid,
+                    name: process_name(pid).unwrap_or_else(|| format!("pid {pid}")),
+                    input_id: input_id.clone(),
+                    input_name: input_name.clone(),
+                    active: state == AudioSessionStateActive,
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| b.active.cmp(&a.active).then(a.name.cmp(&b.name)));
+    Ok(out)
+}
+
+impl Recorder {
+    /// The recorder as a routable source (its own audio output).
+    pub fn as_source(&self) -> AppSource {
+        AppSource { pid: self.pid, name: self.name.clone(), active: self.active, peak: 0.0 }
+    }
+}
+
+/// A running process: (pid, parent pid, exe name).
+pub type ProcessInfo = (u32, u32, String);
+
+/// All running processes (cheap; used to find recording apps that are open
+/// but have no audio stream yet, like Discord before a call).
+pub fn running_processes() -> Vec<ProcessInfo> {
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+    };
+    let mut out = Vec::new();
+    unsafe {
+        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return out };
+        let mut e = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+        let mut ok = Process32FirstW(snap, &mut e).is_ok();
+        while ok {
+            let len = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(e.szExeFile.len());
+            out.push((e.th32ProcessID, e.th32ParentProcessID, String::from_utf16_lossy(&e.szExeFile[..len])));
+            ok = Process32NextW(snap, &mut e).is_ok();
+        }
+        let _ = CloseHandle(snap);
+    }
+    out
+}
+
+/// For an exe name, the top-most running process of that name (e.g. the main
+/// Discord.exe rather than one of its helpers). Capturing it includes its
+/// child processes.
+pub fn root_process(procs: &[ProcessInfo], exe: &str) -> Option<u32> {
+    let same: Vec<&ProcessInfo> = procs.iter().filter(|p| p.2.eq_ignore_ascii_case(exe)).collect();
+    same.iter()
+        .find(|p| !same.iter().any(|q| q.0 == p.1))
+        .or(same.first())
+        .map(|p| p.0)
+}
+
 /// Resolve user input ("spotify", "spotify.exe" or "1234") to a process id.
 /// Prefers an app that is actively playing.
 pub fn find_app(query: &str) -> Result<Option<AppSource>> {

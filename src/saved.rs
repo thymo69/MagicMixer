@@ -1,4 +1,4 @@
-//! Saved connections: remembered between runs in
+﻿//! Saved connections: remembered between runs in
 //! %APPDATA%\MagicMixer\connections.json.
 //!
 //! Apps are remembered by executable name (process ids change every run) and
@@ -27,15 +27,26 @@ pub struct SavedConnection {
     /// line. Saved connections always match exactly.
     #[serde(skip)]
     pub loose: bool,
+    /// The recording/effects app this connection feeds (e.g. "Ableton Live 12
+    /// Lite.exe"), when it goes source -> app rather than straight to a device.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
 }
 
 fn one() -> f32 {
     1.0
 }
 
-#[derive(Serialize, Deserialize, Default)]
-struct File {
-    connections: Vec<SavedConnection>,
+/// Everything Magic Mixer remembers between runs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct Saved {
+    pub connections: Vec<SavedConnection>,
+    /// Apps the user moved into the "recording / effects" column.
+    #[serde(default)]
+    pub middle_apps: Vec<String>,
+    /// Apps the user moved out of it (back to sources).
+    #[serde(default)]
+    pub source_apps: Vec<String>,
 }
 
 impl SavedConnection {
@@ -47,6 +58,7 @@ impl SavedConnection {
             volume: r.gain.get(),
             muted: r.gain.is_muted(),
             loose: false,
+            via: None,
         }
     }
 
@@ -77,17 +89,16 @@ pub fn path() -> PathBuf {
     base.join("MagicMixer").join("connections.json")
 }
 
-/// Load saved connections. A missing or unreadable file gives an empty list.
-pub fn load() -> Vec<SavedConnection> {
+/// Load saved state. A missing or unreadable file gives an empty state.
+pub fn load() -> Saved {
     std::fs::read_to_string(path())
         .ok()
-        .and_then(|s| serde_json::from_str::<File>(&s).ok())
-        .map(|f| f.connections)
+        .and_then(|s| serde_json::from_str::<Saved>(&s).ok())
         .unwrap_or_default()
 }
 
-pub fn to_json(conns: &[SavedConnection]) -> String {
-    serde_json::to_string_pretty(&File { connections: conns.to_vec() }).unwrap_or_default()
+pub fn to_json(saved: &Saved) -> String {
+    serde_json::to_string_pretty(saved).unwrap_or_default()
 }
 
 /// Write the file atomically (temp file + rename) so a crash can't corrupt it.

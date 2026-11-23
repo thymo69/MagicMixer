@@ -16,9 +16,23 @@ Re-run it to update.
 
 ## The app (`magic-mixer-gui.exe`)
 
-1. Click an app on the left (only apps that have made sound are listed).
-2. Click where its sound should go on the right. A cable appears.
+Three columns follow the signal from left to right:
+
+| SOURCES | RECORDING / EFFECTS APPS | OUTPUTS |
+|---|---|---|
+| apps playing sound (Spotify, a game) | Ableton, Discord, OBS, ... | speakers, headphones, cables |
+
+1. Click a source, then click a recording app (or an output). A cable appears.
+2. Click a recording app, then an output, to send *its* sound on.
 3. Use the Connections bar at the bottom for volume, mute and disconnect.
+
+Recording apps are fed through VB-Cable: Magic Mixer plays the source into
+"CABLE Input", and the app must record from "CABLE Output". The card says
+so, and shows "ready" when Windows can confirm the app is listening there
+(apps using ASIO, like Ableton often does, can't be seen, so the hint stays).
+Right-click any app to move it between the Sources and Recording columns.
+One VB-Cable is shared: every app recording from "CABLE Output" hears
+everything sent into it.
 
 Click an existing app-to-output pair again to disconnect it. Press Esc to
 cancel a selection. If an app closes and reopens, its cables reconnect

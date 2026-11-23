@@ -64,6 +64,18 @@ fn cmd_apps() -> Res {
         let state = if a.active { "playing" } else { "idle" };
         println!("{:>7}  {:<8} {:<22} {}", a.pid, state, bar(a.peak), a.name);
     }
+    let recs = sources::list_recorders()?;
+    if !recs.is_empty() {
+        let outs = outputs::list_devices(Direction::Output)?;
+        println!("\nRecording apps:");
+        for r in recs {
+            let feed = outputs::feeding_output(&r.input_name, &outs)
+                .map(|d| format!("  (fed by {})", d.name))
+                .unwrap_or_default();
+            let state = if r.active { "recording" } else { "idle" };
+            println!("{:>7}  {:<9} {} <- {}{}", r.pid, state, r.name, r.input_name, feed);
+        }
+    }
     Ok(())
 }
 
