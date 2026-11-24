@@ -6,6 +6,8 @@ pub mod mixer;
 pub mod outputs;
 pub mod ring;
 pub mod icon;
+pub mod midi;
+pub mod plugins;
 pub mod routes;
 pub mod saved;
 pub mod sources;

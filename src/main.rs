@@ -35,6 +35,13 @@ fn main() {
         Some("route") if args.len() >= 3 => cmd_route(&args[1], &args[2], args.get(3)),
         Some("meter") if args.len() >= 2 => cmd_meter(&args[1], args.get(2)),
         Some("default") if args.len() >= 2 => cmd_default(&args[1]),
+        Some("midi") => cmd_midi(),
+        Some("midi-test") => cmd_midi_test(args.get(1).map(String::as_str), args.get(2).map(String::as_str)),
+        Some("plugins") => cmd_plugins(),
+        // Internal: run by `plugins` in a child process, one per plugin.
+        Some("probe-plugin") if args.len() >= 2 => {
+            magic_mixer::plugins::probe_in_process(std::path::Path::new(&args[1])).map_err(|e| e.into())
+        }
         // Used by install.ps1 to produce the shortcut icon.
         Some("make-icon") if args.len() >= 2 => {
             std::fs::write(&args[1], magic_mixer::icon::ico_bytes()).map_err(|e| e.into())
@@ -164,6 +171,49 @@ fn cmd_route(app: &str, out: &str, gain: Option<&String>) -> Res {
         }
         Some(e) => Err(e.into()),
     }
+}
+
+fn cmd_midi() -> Res {
+    let p = magic_mixer::midi::list()?;
+    println!("MIDI inputs (Magic Mixer can listen to):");
+    for n in &p.inputs {
+        println!("  {n}");
+    }
+    println!("MIDI outputs (Magic Mixer can send to):");
+    for n in &p.outputs {
+        println!("  {n}");
+    }
+    Ok(())
+}
+
+fn cmd_midi_test(send_to: Option<&str>, listen_on: Option<&str>) -> Res {
+    let (s, l) = (send_to.unwrap_or("loopback (a)"), listen_on.unwrap_or("loopback (b)"));
+    println!("Sending a note into '{s}', listening on '{l}'...");
+    let got = magic_mixer::midi::loopback_test(s, l)?;
+    for m in &got {
+        println!("  received: {}", m.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" "));
+    }
+    if got.is_empty() {
+        Err("nothing arrived".into())
+    } else {
+        println!("OK: {} message(s) came through.", got.len());
+        Ok(())
+    }
+}
+
+fn cmd_plugins() -> Res {
+    println!("Scanning VST3 plugins (each in its own process)...");
+    for r in magic_mixer::plugins::scan() {
+        match r {
+            Ok(list) => {
+                for p in list {
+                    println!("  {:<10} {:<22} {:<12} {}", p.kind, p.name, p.vendor, p.subcategories);
+                }
+            }
+            Err((path, e)) => println!("  FAILED     {}  ({e})", path.display()),
+        }
+    }
+    Ok(())
 }
 
 fn cmd_default(dev: &str) -> Res {
