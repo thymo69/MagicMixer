@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "magic-mixer"
 version = "0.1.0"
 edition = "2021"
@@ -10,6 +10,7 @@ eframe = "0.29"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 midir = "0.10"
+vst3 = "0.3"
 
 [dependencies.windows]
 version = "0.58"

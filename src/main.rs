@@ -38,6 +38,8 @@ fn main() {
         Some("midi") => cmd_midi(),
         Some("midi-test") => cmd_midi_test(args.get(1).map(String::as_str), args.get(2).map(String::as_str)),
         Some("plugins") => cmd_plugins(),
+        Some("vst-test") => cmd_vst_test(args.get(1).map(String::as_str)),
+        Some("rack-test") if args.len() >= 5 => cmd_rack_test(&args[1], &args[2], &args[3], args[4].parse().unwrap_or(8.0)),
         // Internal: run by `plugins` in a child process, one per plugin.
         Some("probe-plugin") if args.len() >= 2 => {
             magic_mixer::plugins::probe_in_process(std::path::Path::new(&args[1])).map_err(|e| e.into())
@@ -213,6 +215,106 @@ fn cmd_plugins() -> Res {
             Err((path, e)) => println!("  FAILED     {}  ({e})", path.display()),
         }
     }
+    Ok(())
+}
+
+/// Load every scanned plugin, push 1 s of audio (effects: a 440 Hz tone;
+/// instruments: a held middle C) through it, and report the output level.
+fn cmd_vst_test(only: Option<&str>) -> Res {
+    use magic_mixer::vst3host::{Plugin, PluginDesc, BLOCK, SAMPLE_RATE};
+    for r in magic_mixer::plugins::scan() {
+        let Ok(list) = r else { continue };
+        for p in list {
+            if only.is_some_and(|o| !p.name.to_lowercase().contains(&o.to_lowercase())) {
+                continue;
+            }
+            eprintln!("testing {}...", p.name);
+            let desc = PluginDesc { path: p.path.clone(), name: p.name.clone(), kind: p.kind.clone() };
+            let t0 = std::time::Instant::now();
+            let mut plug = match Plugin::load(&desc, None) {
+                Ok(pl) => pl,
+                Err(e) => {
+                    println!("  {:<16} LOAD FAILED: {e}", p.name);
+                    continue;
+                }
+            };
+            let load_ms = t0.elapsed().as_millis();
+            let (mut peak, mut sum, mut count, mut in_peak) = (0f32, 0f64, 0usize, 0f32);
+            let blocks = SAMPLE_RATE as usize / BLOCK;
+            let t1 = std::time::Instant::now();
+            for b in 0..blocks {
+                let mut l = vec![0f32; BLOCK];
+                let mut r = vec![0f32; BLOCK];
+                if !desc.is_instrument() {
+                    for i in 0..BLOCK {
+                        let t = (b * BLOCK + i) as f32 / SAMPLE_RATE as f32;
+                        l[i] = 0.25 * (2.0 * std::f32::consts::PI * 440.0 * t).sin();
+                        r[i] = l[i];
+                        in_peak = in_peak.max(l[i].abs());
+                    }
+                }
+                let midi: Vec<[u8; 3]> = if b == 0 { vec![[0x90, 60, 100]] } else { vec![] };
+                plug.process(&mut l, &mut r, if desc.is_instrument() { &midi } else { &[] });
+                for s in l.iter().chain(r.iter()) {
+                    peak = peak.max(s.abs());
+                    sum += (*s as f64).powi(2);
+                    count += 1;
+                }
+            }
+            let cpu = t1.elapsed().as_secs_f64() * 100.0; // % of real time for 1 s of audio
+            let (cs, ps) = plug.state();
+            let rms = (sum / count as f64).sqrt();
+            println!(
+                "  {:<16} {:<10} loaded {:>5} ms  out peak {:.3} rms {:.4}{}  CPU {:.1}%  state {} + {} bytes  editor: {}",
+                p.name,
+                p.kind,
+                load_ms,
+                peak,
+                rms,
+                if desc.is_instrument() { String::new() } else { format!(" (in {:.3})", in_peak) },
+                cpu,
+                cs.len(),
+                ps.len(),
+                if plug.has_editor() { "yes" } else { "no" }
+            );
+        }
+    }
+    Ok(())
+}
+
+/// source app (or "midi" for an instrument test) -> rack with one plugin -> output device, for `secs`.
+fn cmd_rack_test(app: &str, plugin: &str, out: &str, secs: f32) -> Res {
+    use magic_mixer::{rack, vst3host::{Plugin, PluginDesc}};
+    let found = magic_mixer::plugins::scan()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .find(|p| p.name.to_lowercase().contains(&plugin.to_lowercase()))
+        .ok_or("plugin not found")?;
+    let desc = PluginDesc { path: found.path, name: found.name, kind: found.kind };
+    let output = outputs::find_device(out, Direction::Output)?.ok_or("output not found")?;
+    let r = rack::create(1, "test rack");
+    r.push(Plugin::load(&desc, None)?);
+    let mut mixer = mixer::Mixer::new();
+    if app != "midi" {
+        let source = sources::find_app(app)?.ok_or("app not found")?;
+        mixer.connect(source, rack::as_output(1), 1.0);
+    }
+    mixer.connect(rack::as_source(1), output.clone(), 1.0);
+    println!("{app} -> [{}] -> {} for {secs}s", desc.name, output.name);
+    let t0 = std::time::Instant::now();
+    let mut note = false;
+    while t0.elapsed().as_secs_f32() < secs {
+        if app == "midi" {
+            // Play middle C on/off every half second.
+            r.send_midi(if note { [0x80, 60, 0] } else { [0x90, 60, 100] });
+            note = !note;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        println!("  rack out {:.3}  errors: {:?}", r.take_peak(), mixer.routes().iter().filter_map(|x| x.error()).collect::<Vec<_>>());
+    }
+    drop(mixer);
+    drop(rack::destroy(1));
     Ok(())
 }
 

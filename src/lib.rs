@@ -11,3 +11,5 @@ pub mod plugins;
 pub mod routes;
 pub mod saved;
 pub mod sources;
+pub mod vst3host;
+pub mod rack;

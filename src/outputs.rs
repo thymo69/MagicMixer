@@ -217,9 +217,17 @@ pub fn play_to_device(device_id: &str, ring: Arc<Ring>, gain: Arc<Gain>, stop: A
                 peak = peak.max(s.abs());
             }
             gain.report_peak(peak);
-            let ptr = render.GetBuffer(free as u32)?;
-            std::ptr::copy_nonoverlapping(tmp.as_ptr(), ptr as *mut f32, free * channels);
-            render.ReleaseBuffer(free as u32, 0)?;
+            // Write only real audio while the device still has >10 ms queued;
+            // pad with silence only when it would otherwise run dry.
+            let got_frames = got / channels;
+            let low = (padding as usize) < rate / 100;
+            let frames = if got_frames >= free || low { free } else { got_frames };
+            if frames == 0 {
+                continue;
+            }
+            let ptr = render.GetBuffer(frames as u32)?;
+            std::ptr::copy_nonoverlapping(tmp.as_ptr(), ptr as *mut f32, frames * channels);
+            render.ReleaseBuffer(frames as u32, 0)?;
         }
         let _ = client.Stop();
         let _ = CloseHandle(event);

@@ -55,6 +55,8 @@ pub struct Route {
     stop: Arc<AtomicBool>,
     error: Arc<Mutex<Option<String>>>,
     threads: Vec<JoinHandle<()>>,
+    /// Racks this route is attached to (detached on stop).
+    racks: Vec<u64>,
 }
 
 /// Run one side of a route on its own thread. If it fails, record the error
@@ -103,18 +105,46 @@ impl Route {
         let stop = Arc::new(AtomicBool::new(false));
         let error = Arc::new(Mutex::new(None));
 
-        let cap = {
-            let (ring, stop2, pid, input) = (ring.clone(), stop.clone(), source.pid, source.input_device.clone());
-            spawn_side("capture", stop.clone(), error.clone(), move || match input {
-                Some(dev) => outputs::capture_device(&dev, ring, stop2),
-                None => sources::capture_app(pid, ring, stop2),
-            })
+        let mut threads = Vec::new();
+        let mut racks = Vec::new();
+        let missing = |error: &Arc<Mutex<Option<String>>>| {
+            error.lock().unwrap().get_or_insert_with(|| "that plugin rack no longer exists".into());
         };
-        let play = {
-            let (stop2, gain, dev) = (stop.clone(), gain.clone(), output.id.clone());
-            spawn_side("playback", stop.clone(), error.clone(), move || outputs::play_to_device(&dev, ring, gain, stop2))
-        };
-        Route { id, source, output, gain, stop, error, threads: vec![cap, play] }
+
+        // Source side: a rack's output, or capture from an app / input device.
+        match crate::rack::rack_id(&source.name) {
+            Some(rid) => match crate::rack::get(rid) {
+                Some(r) => {
+                    r.attach_output(id, ring.clone());
+                    racks.push(rid);
+                }
+                None => missing(&error),
+            },
+            None => {
+                let (ring, stop2, pid, input) = (ring.clone(), stop.clone(), source.pid, source.input_device.clone());
+                threads.push(spawn_side("capture", stop.clone(), error.clone(), move || match input {
+                    Some(dev) => outputs::capture_device(&dev, ring, stop2),
+                    None => sources::capture_app(pid, ring, stop2),
+                }));
+            }
+        }
+        // Destination side: into a rack, or play to a device.
+        match crate::rack::rack_id(&output.id) {
+            Some(rid) => match crate::rack::get(rid) {
+                Some(r) => {
+                    r.attach_input(id, ring.clone(), gain.clone());
+                    racks.push(rid);
+                }
+                None => missing(&error),
+            },
+            None => {
+                let (stop2, gain, dev) = (stop.clone(), gain.clone(), output.id.clone());
+                threads.push(spawn_side("playback", stop.clone(), error.clone(), move || {
+                    outputs::play_to_device(&dev, ring, gain, stop2)
+                }));
+            }
+        }
+        Route { id, source, output, gain, stop, error, threads, racks }
     }
 
     /// The first error either side hit, if any. A failed route has stopped.
@@ -131,6 +161,11 @@ impl Route {
         self.stop.store(true, Ordering::Relaxed);
         for t in self.threads.drain(..) {
             let _ = t.join();
+        }
+        for rid in self.racks.drain(..) {
+            if let Some(r) = crate::rack::get(rid) {
+                r.detach(self.id);
+            }
         }
     }
 
