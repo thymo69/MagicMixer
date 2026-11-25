@@ -19,8 +19,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Pos2, Rect, RichText, Sense, Stroke, Vec2};
+mod racks_ui;
+
 use magic_mixer::com::ComGuard;
 use magic_mixer::mixer::Mixer;
+use magic_mixer::rack;
 use magic_mixer::outputs::{self, Device, Direction};
 use magic_mixer::saved::{self, Saved, SavedConnection};
 use magic_mixer::sources::{self, AppSource, Recorder};
@@ -37,6 +40,8 @@ struct Snapshot {
     outputs: Vec<Device>,
     /// Recording devices (mics, headsets, line in).
     inputs: Vec<Device>,
+    /// MIDI input port names (keyboards, controllers, virtual ports).
+    midi_ins: Vec<String>,
     error: Option<String>,
     loaded: bool,
 }
@@ -53,7 +58,10 @@ fn spawn_poller(ctx: egui::Context) -> Arc<Mutex<Snapshot>> {
                 // The process list changes slowly; refresh it every ~1.5 s.
                 if tick % 10 == 0 {
                     let procs = sources::running_processes();
-                    shared.lock().unwrap().processes = procs;
+                    let midi = magic_mixer::midi::list().map(|p| p.inputs).unwrap_or_default();
+                    let mut s = shared.lock().unwrap();
+                    s.processes = procs;
+                    s.midi_ins = midi;
                 }
                 tick = tick.wrapping_add(1);
                 let apps = sources::list_apps();
@@ -94,6 +102,22 @@ fn app_label(name: &str) -> String {
     match c.next() {
         Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
         None => base.to_string(),
+    }
+}
+
+/// Display name for an app / input / rack source ("rack:3" -> the rack's name).
+fn display_name(racks: &HashMap<u64, String>, name: &str) -> String {
+    match rack::rack_id(name) {
+        Some(id) => racks.get(&id).cloned().unwrap_or_else(|| format!("Rack {id}")),
+        None => app_label(name),
+    }
+}
+
+/// Display name for a device / rack destination.
+fn display_device(racks: &HashMap<u64, String>, name: &str) -> String {
+    match rack::rack_id(name) {
+        Some(id) => racks.get(&id).cloned().unwrap_or_else(|| format!("Rack {id}")),
+        None => short_device(name).to_string(),
     }
 }
 
@@ -191,6 +215,13 @@ struct MagicMixer {
     source_apps: Vec<String>,
     last_saved: String,
     last_save_check: Instant,
+    /// VST plugin racks.
+    racks: racks_ui::Racks,
+    /// Column widths as fractions (sources, middle, outputs).
+    col_frac: [f32; 3],
+    /// Device names hidden from the columns.
+    hidden: Vec<String>,
+    show_hidden: bool,
 }
 
 impl MagicMixer {
@@ -198,6 +229,11 @@ impl MagicMixer {
         cc.egui_ctx.set_zoom_factor(1.1);
         let saved = saved::load();
         let last_saved = saved::to_json(&saved);
+        let mut racks = racks_ui::Racks::new(cc.egui_ctx.clone());
+        let rack_errors = racks.restore(&saved.racks);
+        let status = (!rack_errors.is_empty()).then(|| format!("Some plugins didn\u{2019}t load: {}", rack_errors.join("; ")));
+        let col_frac = saved.columns.unwrap_or([1.0 / 3.0; 3]);
+        let hidden = saved.hidden_devices.clone();
         let mut waiting = saved.connections;
         for c in extra {
             if !waiting.iter().any(|w| w.app.eq_ignore_ascii_case(&c.app) && w.device_name == c.device_name) {
@@ -208,7 +244,7 @@ impl MagicMixer {
             snap: spawn_poller(cc.egui_ctx.clone()),
             mixer: Mixer::new(),
             selected: None,
-            status: None,
+            status,
             levels: HashMap::new(),
             via: HashMap::new(),
             waiting,
@@ -216,7 +252,16 @@ impl MagicMixer {
             source_apps: saved.source_apps,
             last_saved,
             last_save_check: Instant::now(),
+            racks,
+            col_frac,
+            hidden,
+            show_hidden: false,
         }
+    }
+
+    /// Display name for an app, input, or rack ("rack:3" -> its name).
+    fn rack_names(&self) -> HashMap<u64, String> {
+        self.racks.list.iter().map(|r| (r.id, self.racks.name(r.id))).collect()
     }
 
     fn is_middle(&self, name: &str, records: bool) -> bool {
@@ -334,7 +379,14 @@ impl MagicMixer {
             .map(|r| SavedConnection { via: self.via.get(&r.id).cloned(), ..SavedConnection::from_route(r) })
             .collect();
         connections.extend(self.waiting.iter().cloned());
-        let state = Saved { connections, middle_apps: self.middle_apps.clone(), source_apps: self.source_apps.clone() };
+        let state = Saved {
+            connections,
+            middle_apps: self.middle_apps.clone(),
+            source_apps: self.source_apps.clone(),
+            racks: self.racks.saved(),
+            hidden_devices: self.hidden.clone(),
+            columns: Some(self.col_frac),
+        };
         let json = saved::to_json(&state);
         if json != self.last_saved {
             match saved::save_json(&json) {
@@ -359,7 +411,7 @@ impl MagicMixer {
 
     /// Connect (or disconnect, if already connected) `src` -> `dest`.
     fn toggle(&mut self, src: AppSource, dest: Device, via: Option<String>, label: String) {
-        let src_name = app_label(&src.name);
+        let src_name = display_name(&self.rack_names(), &src.name);
         match self.mixer.find(src.pid, &dest.id).map(|r| r.id) {
             Some(id) => {
                 self.mixer.disconnect(id);
@@ -445,21 +497,27 @@ fn cable(painter: &egui::Painter, a: Pos2, b: Pos2, stroke: Stroke) {
 impl eframe::App for MagicMixer {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(Duration::from_millis(60));
-        let (apps, recs, procs, outs, ins, poll_error, loaded) = {
+        let (apps, recs, procs, outs, ins, midi_ports, poll_error, loaded) = {
             let s = self.snap.lock().unwrap();
-            (s.apps.clone(), s.recorders.clone(), s.processes.clone(), s.outputs.clone(), s.inputs.clone(), s.error.clone(), s.loaded)
+            (
+                s.apps.clone(),
+                s.recorders.clone(),
+                s.processes.clone(),
+                s.outputs.clone(),
+                s.inputs.clone(),
+                s.midi_ins.clone(),
+                s.error.clone(),
+                s.loaded,
+            )
         };
-        let view = self.build_view(&apps, &recs, &procs, &outs, &ins);
-        // A connection into a cable that feeds exactly one recording app is
-        // shown (and saved) as going to that app.
-        for r in self.mixer.routes() {
-            if !self.via.contains_key(&r.id) {
-                let mut fed = view.middle.iter().filter(|m| m.feed.as_ref().is_some_and(|f| f.id == r.output.id));
-                if let (Some(m), None) = (fed.next(), fed.next()) {
-                    self.via.insert(r.id, m.source.name.clone());
-                }
-            }
+        let mut view = self.build_view(&apps, &recs, &procs, &outs, &ins);
+        // Racks are both sources (their output) and destinations (their input).
+        for r in &self.racks.list {
+            view.routable.push(rack::as_source(r.id));
+            view.all_outputs.push(rack::as_output(r.id));
         }
+        self.racks.tick();
+        let names = self.rack_names();
         if loaded {
             if !self.waiting.is_empty() {
                 self.start_waiting(&view);
@@ -497,7 +555,7 @@ impl eframe::App for MagicMixer {
                                 .map(|m| app_label(&m.source.name))
                                 .collect();
                             if hearers.is_empty() {
-                                short_device(&r.output.name).to_string()
+                                display_device(&names, &r.output.name)
                             } else {
                                 format!("{} (heard by {})", short_device(&r.output.name), hearers.join(", "))
                             }
@@ -510,7 +568,7 @@ impl eframe::App for MagicMixer {
                     ui.horizontal(|ui| {
                         let (dot, _) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
                         ui.painter().circle_filled(dot.center(), 5.0, cable_color(r.id));
-                        ui.label(RichText::new(format!("{}  ->  {}", app_label(&r.source.name), dest)).strong());
+                        ui.label(RichText::new(format!("{}  ->  {}", display_name(&names, &r.source.name), dest)).strong());
                     });
                     let mut pct = r.gain.get() * 100.0;
                     if ui.add(egui::Slider::new(&mut pct, 0.0..=200.0).suffix("%").integer().text("volume")).changed() {
@@ -538,8 +596,8 @@ impl eframe::App for MagicMixer {
                 ui.horizontal(|ui| {
                     let (dot, _) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
                     ui.painter().circle_stroke(dot.center(), 4.5, Stroke::new(1.5_f32, Color32::GRAY));
-                    let dest = w.via.as_deref().map(app_label).unwrap_or_else(|| short_device(&w.device_name).to_string());
-                    ui.label(RichText::new(format!("{}  ->  {}", app_label(&w.app), dest)).strong());
+                    let dest = w.via.as_deref().map(app_label).unwrap_or_else(|| display_device(&names, &w.device_name));
+                    ui.label(RichText::new(format!("{}  ->  {}", display_name(&names, &w.app), dest)).strong());
                     ui.add_space(10.0);
                     let why = if w.find_app(&view.routable).is_none() {
                         format!("Will connect when {} plays sound", app_label(&w.app))
@@ -571,9 +629,13 @@ impl eframe::App for MagicMixer {
             Source(AppSource),
             Middle(MiddleApp),
             Output(Device),
+            Rack(u64),
         }
         let mut click: Option<Click> = None;
         let mut move_req: Option<(String, bool)> = None;
+        let mut rack_actions: Vec<(u64, racks_ui::RackAction)> = Vec::new();
+        let mut new_rack = false;
+        let mut hide_req: Option<(String, bool)> = None; // (device name, hide?)
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -581,7 +643,7 @@ impl eframe::App for MagicMixer {
                 ui.add_space(12.0);
                 let step = match self.selected.and_then(|p| view.routable.iter().find(|a| a.pid == p)) {
                     None => "Step 1:  click a sound source".to_string(),
-                    Some(a) => format!("Step 2:  click where {}\u{2019}s sound should go  (Esc to cancel)", app_label(&a.name)),
+                    Some(a) => format!("Step 2:  click where {}\u{2019}s sound should go  (Esc to cancel)", display_name(&names, &a.name)),
                 };
                 ui.label(RichText::new(step).size(16.0));
             });
@@ -594,13 +656,23 @@ impl eframe::App for MagicMixer {
             ui.add_space(8.0);
 
             let gap = 70.0;
-            let col_w = ((ui.available_width() - 2.0 * gap) / 3.0).max(170.0);
-            let selected_is_source = self.selected.is_some_and(|p| view.sources.iter().any(|s| s.pid == p));
+            // Leave room for the gaps plus egui's spacing between items (and the scrollbar).
+            let avail = (ui.available_width() - 2.0 * gap - 4.0 * ui.spacing().item_spacing.x - 16.0).max(450.0);
+            let col_ws = self.col_frac.map(|f| (avail * f).max(150.0));
+            let selected_is_source = self.selected.is_some_and(|p| {
+                view.sources.iter().any(|s| s.pid == p) || self.racks.list.iter().any(|r| rack::as_source(r.id).pid == p)
+            });
             let routes = self.mixer.routes();
             let color_from = |pid: u32| routes.iter().find(|r| r.source.pid == pid).map(|r| cable_color(r.id));
+            let hidden = &self.hidden;
+            let show_hidden = &mut self.show_hidden;
+            let racks = &mut self.racks;
+            let col_frac = &mut self.col_frac;
+            let is_hidden = |name: &str| hidden.iter().any(|h| h == name);
 
             egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.horizontal_top(|ui| {
+                let cols = ui.horizontal_top(|ui| {
+                    let col_w = col_ws[0];
                     // ---- Column 1: sources ----
                     ui.vertical(|ui| {
                         ui.set_width(col_w);
@@ -609,7 +681,14 @@ impl eframe::App for MagicMixer {
                             ui.label(RichText::new("Nothing is playing yet.").weak());
                         }
                         for a in &view.sources {
+                            let hid = a.is_input() && is_hidden(&a.name);
+                            if hid && !*show_hidden {
+                                continue;
+                            }
                             let resp = card(ui, self.selected == Some(a.pid), color_from(a.pid), |ui| {
+                                if hid {
+                                    ui.set_opacity(0.45);
+                                }
                                 ui.horizontal(|ui| {
                                     if a.is_input() {
                                         // "Headset (Example Headphones)" -> "Example Headphones" + "Headset mic"
@@ -635,14 +714,18 @@ impl eframe::App for MagicMixer {
                             if resp.clicked() {
                                 click = Some(Click::Source(a.clone()));
                             }
-                            if !a.is_input() {
-                                resp.context_menu(|ui| {
-                                    if ui.button("Move to Recording / effects apps").clicked() {
-                                        move_req = Some((a.name.clone(), true));
+                            resp.context_menu(|ui| {
+                                if a.is_input() {
+                                    let label = if hid { "Show this device" } else { "Hide this device" };
+                                    if ui.button(label).clicked() {
+                                        hide_req = Some((a.name.clone(), !hid));
                                         ui.close_menu();
                                     }
-                                });
-                            }
+                                } else if ui.button("Move to Recording / effects apps").clicked() {
+                                    move_req = Some((a.name.clone(), true));
+                                    ui.close_menu();
+                                }
+                            });
                             ui.add_space(4.0);
                         }
                         ui.add_space(6.0);
@@ -651,9 +734,9 @@ impl eframe::App for MagicMixer {
 
                     ui.add_space(gap);
 
-                    // ---- Column 2: recording / effects apps ----
+                    // ---- Column 2: recording / effects apps, plugin racks ----
                     ui.vertical(|ui| {
-                        ui.set_width(col_w);
+                        ui.set_width(col_ws[1]);
                         column_header(ui, "RECORDING / EFFECTS APPS", "Ableton, Discord, OBS\u{2026}");
                         if loaded && view.middle.is_empty() {
                             ui.label(
@@ -705,18 +788,51 @@ impl eframe::App for MagicMixer {
                             });
                             ui.add_space(4.0);
                         }
+
+                        // Plugin racks (VST containers).
+                        ui.add_space(10.0);
+                        column_header(ui, "PLUGIN RACKS", "VST instruments and effects");
+                        let ids: Vec<u64> = racks.list.iter().map(|r| r.id).collect();
+                        for id in ids {
+                            let src_pid = rack::as_source(id).pid;
+                            let rid = format!("rack:{id}");
+                            let accent = routes
+                                .iter()
+                                .find(|r| r.output.id == rid)
+                                .map(|r| cable_color(r.id))
+                                .or_else(|| color_from(src_pid));
+                            let (title, rect, acts) = racks.card(ui, id, self.selected == Some(src_pid), accent, &midi_ports);
+                            let y = title.rect.center().y;
+                            dev_anchor.insert(rid, Pos2::new(rect.left(), y));
+                            out_anchor.insert(src_pid, Pos2::new(rect.right(), y));
+                            if title.clicked() {
+                                click = Some(Click::Rack(id));
+                            }
+                            rack_actions.extend(acts.into_iter().map(|a| (id, a)));
+                            ui.add_space(4.0);
+                        }
+                        if ui.button("+ New plugin rack").on_hover_text("A container for VST instruments and effects").clicked() {
+                            new_rack = true;
+                        }
                     });
 
                     ui.add_space(gap);
 
                     // ---- Column 3: outputs ----
                     ui.vertical(|ui| {
-                        ui.set_width(col_w);
+                        ui.set_width(col_ws[2]);
                         column_header(ui, "OUTPUTS", "Speakers, headphones, cables");
                         for d in &view.outputs {
+                            let hid = is_hidden(&d.name);
+                            if hid && !*show_hidden {
+                                continue;
+                            }
                             let accent = routes.iter().find(|r| r.output.id == d.id && !self.via.contains_key(&r.id)).map(|r| cable_color(r.id));
                             let (title, hint) = output_label(d);
                             let resp = card(ui, false, accent, |ui| {
+                                if hid {
+                                    ui.set_opacity(0.45);
+                                }
                                 ui.label(RichText::new(title).strong().size(15.0));
                                 if !hint.is_empty() {
                                     ui.label(RichText::new(hint).small().weak());
@@ -726,10 +842,50 @@ impl eframe::App for MagicMixer {
                             if resp.clicked() {
                                 click = Some(Click::Output(d.clone()));
                             }
+                            resp.context_menu(|ui| {
+                                let label = if hid { "Show this device" } else { "Hide this device" };
+                                if ui.button(label).clicked() {
+                                    hide_req = Some((d.name.clone(), !hid));
+                                    ui.close_menu();
+                                }
+                            });
                             ui.add_space(4.0);
                         }
+                        if !hidden.is_empty() {
+                            ui.add_space(6.0);
+                            ui.checkbox(show_hidden, RichText::new(format!("Show hidden devices ({})", hidden.len())).small());
+                        }
+                        ui.label(RichText::new("Right-click a device to hide it.").small().weak());
                     });
                 });
+
+                // ---- Column splitters: drag to resize ----
+                let area = cols.response.rect;
+                let mut x = area.left();
+                for i in 0..2 {
+                    x += col_ws[i] + gap / 2.0;
+                    let handle = Rect::from_min_max(Pos2::new(x - 5.0, area.top()), Pos2::new(x + 5.0, area.bottom()));
+                    let resp = ui.interact(handle, ui.id().with(("split", i)), Sense::drag());
+                    if resp.hovered() || resp.dragged() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                        ui.painter().line_segment(
+                            [Pos2::new(x, area.top()), Pos2::new(x, area.bottom())],
+                            Stroke::new(1.0_f32, ui.visuals().selection.stroke.color.linear_multiply(0.5)),
+                        );
+                    }
+                    if resp.dragged() {
+                        let d = resp.drag_delta().x / avail;
+                        let (a, b) = (col_frac[i] + d, col_frac[i + 1] - d);
+                        if a >= 0.15 && b >= 0.15 {
+                            col_frac[i] = a;
+                            col_frac[i + 1] = b;
+                        }
+                    }
+                    if resp.double_clicked() {
+                        *col_frac = [1.0 / 3.0; 3];
+                    }
+                    x += gap / 2.0;
+                }
 
                 // ---- Cables ----
                 let painter = ui.painter();
@@ -773,9 +929,68 @@ impl eframe::App for MagicMixer {
         if let Some((name, to_middle)) = move_req {
             self.move_to_middle(&name, to_middle);
         }
+        if let Some((name, hide)) = hide_req {
+            self.hidden.retain(|h| h != &name);
+            if hide {
+                self.hidden.push(name);
+            }
+        }
+        if new_rack {
+            let id = self.racks.create();
+            self.status = Some(format!("Added {}. Use \u{201C}+ Add plugin\u{201D}, then patch sound into it.", self.racks.name(id)));
+        }
+        for (id, action) in rack_actions {
+            let structural = matches!(
+                action,
+                racks_ui::RackAction::Add(_) | racks_ui::RackAction::Swap(..) | racks_ui::RackAction::Remove(_) | racks_ui::RackAction::Up(_)
+            );
+            if matches!(action, racks_ui::RackAction::Delete) {
+                // Unplug everything going into or out of the rack first.
+                let rid = format!("rack:{id}");
+                let ids: Vec<u64> = self.mixer.routes().iter().filter(|r| r.source.name == rid || r.output.id == rid).map(|r| r.id).collect();
+                for rid in ids {
+                    self.mixer.disconnect(rid);
+                    self.via.remove(&rid);
+                }
+                let rid = format!("rack:{id}");
+                self.waiting.retain(|w| w.app != rid && w.device_id.as_deref() != Some(rid.as_str()));
+                if self.selected == Some(rack::as_source(id).pid) {
+                    self.selected = None;
+                }
+            }
+            if let Some(msg) = self.racks.apply(id, action) {
+                self.status = Some(msg);
+            }
+            if structural {
+                self.racks.save_states();
+            }
+        }
+
         let selected_src = self.selected.and_then(|p| view.routable.iter().find(|a| a.pid == p).cloned());
-        let selected_is_source = self.selected.is_some_and(|p| view.sources.iter().any(|s| s.pid == p));
+        let selected_is_source = selected_src
+            .as_ref()
+            .is_some_and(|s| view.sources.iter().any(|x| x.pid == s.pid) || rack::rack_id(&s.name).is_some());
         match click {
+            Some(Click::Rack(id)) => {
+                let src_pid = rack::as_source(id).pid;
+                let name = self.racks.name(id);
+                match selected_src.clone() {
+                    Some(src) if src.pid != src_pid => {
+                        if rack::get(id).is_some_and(|r| r.is_instrument()) {
+                            self.status = Some(format!(
+                                "{name} is an instrument rack: it\u{2019}s played by MIDI. Click it first to send its sound somewhere."
+                            ));
+                            self.selected = None;
+                        } else {
+                            self.toggle(src, rack::as_output(id), None, name);
+                        }
+                    }
+                    _ => {
+                        self.selected = if self.selected == Some(src_pid) { None } else { Some(src_pid) };
+                        self.status = None;
+                    }
+                }
+            }
             Some(Click::Source(a)) => {
                 self.selected = if self.selected == Some(a.pid) { None } else { Some(a.pid) };
                 self.status = None;
@@ -813,9 +1028,33 @@ impl eframe::App for MagicMixer {
             self.selected = None;
         }
     }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Keep plugin settings and the latest layout.
+        self.racks.save_states();
+        self.last_save_check = Instant::now() - Duration::from_secs(5);
+        self.autosave();
+        // Then shut everything down in order: connections, then plugins (on
+        // this UI thread, as VST3 requires).
+        self.mixer = Mixer::new();
+        self.racks.shutdown();
+    }
 }
 
 fn main() -> eframe::Result<()> {
+    // Internal: probe one plugin in this child process (used by the plugin scan).
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("probe-plugin") {
+        let code = match argv.get(2).map(|p| magic_mixer::plugins::probe_in_process(std::path::Path::new(p))) {
+            Some(Ok(())) => 0,
+            Some(Err(e)) => {
+                eprintln!("{e}");
+                1
+            }
+            None => 2,
+        };
+        std::process::exit(code);
+    }
     if !single_instance() {
         return Ok(());
     }
@@ -840,7 +1079,17 @@ fn main() -> eframe::Result<()> {
             .with_min_inner_size([760.0, 460.0]),
         ..Default::default()
     };
-    eframe::run_native("Magic Mixer", options, Box::new(move |cc| Ok(Box::new(MagicMixer::new(cc, extra)))))
+    let result = eframe::run_native("Magic Mixer", options, Box::new(move |cc| Ok(Box::new(MagicMixer::new(cc, extra)))));
+    // Everything is saved and shut down by now (on_exit). Some plugins hang
+    // for a long time while Windows unloads their DLLs at process exit, so
+    // end the process directly instead of waiting for them.
+    if result.is_ok() {
+        unsafe {
+            use windows::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+            let _ = TerminateProcess(GetCurrentProcess(), 0);
+        }
+    }
+    result
 }
 
 /// Returns false (after bringing the running window to the front) if Magic
@@ -852,7 +1101,8 @@ fn single_instance() -> bool {
     use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE};
     unsafe {
         // The handle is deliberately leaked: the mutex lives as long as the process.
-        let _mutex = CreateMutexW(None, false, w!("Local\\MagicMixerSingleInstance"));
+        let name = windows::core::HSTRING::from(format!("Local\\{}SingleInstance", magic_mixer::saved::folder_name()));
+        let _mutex = CreateMutexW(None, false, &name);
         if GetLastError() == ERROR_ALREADY_EXISTS {
             if let Ok(h) = FindWindowW(None, w!("Magic Mixer")) {
                 let _ = ShowWindow(h, SW_RESTORE);

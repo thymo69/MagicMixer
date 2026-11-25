@@ -57,6 +57,7 @@ pub struct Route {
     threads: Vec<JoinHandle<()>>,
     /// Racks this route is attached to (detached on stop).
     racks: Vec<u64>,
+    ring: Arc<Ring>,
 }
 
 /// Run one side of a route on its own thread. If it fails, record the error
@@ -138,13 +139,13 @@ impl Route {
                 None => missing(&error),
             },
             None => {
-                let (stop2, gain, dev) = (stop.clone(), gain.clone(), output.id.clone());
+                let (stop2, gain, dev, ring) = (stop.clone(), gain.clone(), output.id.clone(), ring.clone());
                 threads.push(spawn_side("playback", stop.clone(), error.clone(), move || {
                     outputs::play_to_device(&dev, ring, gain, stop2)
                 }));
             }
         }
-        Route { id, source, output, gain, stop, error, threads, racks }
+        Route { id, source, output, gain, stop, error, threads, racks, ring }
     }
 
     /// The first error either side hit, if any. A failed route has stopped.
@@ -164,7 +165,7 @@ impl Route {
         }
         for rid in self.racks.drain(..) {
             if let Some(r) = crate::rack::get(rid) {
-                r.detach(self.id);
+                r.detach(&self.ring);
             }
         }
     }

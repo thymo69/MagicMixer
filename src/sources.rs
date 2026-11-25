@@ -76,7 +76,7 @@ pub fn list_apps() -> Result<Vec<AppSource>> {
                 let pid = ctl2.GetProcessId().unwrap_or(0);
                 // Skip idle system pid 0 and ourselves: routing the mixer's
                 // own output back into itself would be a feedback loop.
-                if pid == 0 || pid == std::process::id() {
+                if pid == 0 || pid == std::process::id() || is_own_process(pid) {
                     continue;
                 }
                 let active = ctl.GetState().map(|s| s == AudioSessionStateActive).unwrap_or(false);
@@ -141,7 +141,7 @@ pub fn list_recorders() -> Result<Vec<Recorder>> {
                 let ctl = sessions.GetSession(j)?;
                 let ctl2: IAudioSessionControl2 = ctl.cast()?;
                 let pid = ctl2.GetProcessId().unwrap_or(0);
-                if pid == 0 || pid == std::process::id() {
+                if pid == 0 || pid == std::process::id() || is_own_process(pid) {
                     continue;
                 }
                 let state = ctl.GetState().unwrap_or(AudioSessionStateExpired);
@@ -232,6 +232,12 @@ pub fn find_app(query: &str) -> Result<Option<AppSource>> {
         b.active.cmp(&a.active).then(b.peak.partial_cmp(&a.peak).unwrap_or(std::cmp::Ordering::Equal))
     });
     Ok(matches.into_iter().next())
+}
+
+/// Magic Mixer's own processes (other copies, the command-line tool) are
+/// never shown as apps: routing them would loop audio back into the mixer.
+fn is_own_process(pid: u32) -> bool {
+    process_name(pid).is_some_and(|n| n.to_lowercase().starts_with("magic-mixer"))
 }
 
 fn process_name(pid: u32) -> Option<String> {

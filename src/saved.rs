@@ -47,6 +47,63 @@ pub struct Saved {
     /// Apps the user moved out of it (back to sources).
     #[serde(default)]
     pub source_apps: Vec<String>,
+    /// Plugin racks (VST containers).
+    #[serde(default)]
+    pub racks: Vec<SavedRack>,
+    /// Device names the user hid from the columns.
+    #[serde(default)]
+    pub hidden_devices: Vec<String>,
+    /// Column widths as fractions (sources, middle, outputs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub columns: Option<[f32; 3]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct SavedRack {
+    pub id: u64,
+    pub name: String,
+    /// MIDI input port name feeding this rack (instrument racks).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub midi_in: Option<String>,
+    pub plugins: Vec<SavedPlugin>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct SavedPlugin {
+    pub path: String,
+    pub name: String,
+    pub kind: String,
+    #[serde(default)]
+    pub bypass: bool,
+    /// File (in the plugin-states folder) holding the plugin's settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_file: Option<String>,
+}
+
+/// Folder for plugin settings (binary blobs, kept out of the JSON).
+pub fn state_dir() -> PathBuf {
+    path().parent().map(|p| p.join("plugin-states")).unwrap_or_else(|| PathBuf::from("plugin-states"))
+}
+
+/// Write a plugin state: [u32 len][component state][controller state].
+pub fn write_state(file: &str, state: &(Vec<u8>, Vec<u8>)) -> std::io::Result<()> {
+    let dir = state_dir();
+    std::fs::create_dir_all(&dir)?;
+    let mut buf = Vec::with_capacity(4 + state.0.len() + state.1.len());
+    buf.extend_from_slice(&(state.0.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&state.0);
+    buf.extend_from_slice(&state.1);
+    let tmp = dir.join(format!("{file}.tmp"));
+    std::fs::write(&tmp, &buf)?;
+    std::fs::rename(tmp, dir.join(file))
+}
+
+pub fn read_state(file: &str) -> Option<(Vec<u8>, Vec<u8>)> {
+    let buf = std::fs::read(state_dir().join(file)).ok()?;
+    let n = u32::from_le_bytes(buf.get(..4)?.try_into().ok()?) as usize;
+    let a = buf.get(4..4 + n)?.to_vec();
+    let b = buf.get(4 + n..)?.to_vec();
+    Some((a, b))
 }
 
 impl SavedConnection {
@@ -84,17 +141,40 @@ impl SavedConnection {
     }
 }
 
-pub fn path() -> PathBuf {
-    let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-    base.join("MagicMixer").join("connections.json")
+/// "MagicMixer", or "MagicMixer-<profile>" when MAGIC_MIXER_PROFILE is set
+/// (lets a test copy run beside the real one without sharing settings).
+pub fn folder_name() -> String {
+    match std::env::var("MAGIC_MIXER_PROFILE") {
+        Ok(p) if !p.is_empty() => format!("MagicMixer-{p}"),
+        _ => "MagicMixer".to_string(),
+    }
 }
 
-/// Load saved state. A missing or unreadable file gives an empty state.
+pub fn path() -> PathBuf {
+    let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    base.join(folder_name()).join("connections.json")
+}
+
+/// Load saved state. A missing file gives an empty state. A file that can't
+/// be read (e.g. edited by hand and broken) is copied to
+/// `connections.json.unreadable-<time>` first, so the next save can never
+/// silently destroy the user's setup.
 pub fn load() -> Saved {
-    std::fs::read_to_string(path())
-        .ok()
-        .and_then(|s| serde_json::from_str::<Saved>(&s).ok())
-        .unwrap_or_default()
+    let p = path();
+    let Ok(text) = std::fs::read_to_string(&p) else { return Saved::default() };
+    // Tolerate the byte-order mark Notepad / PowerShell add.
+    let text = text.trim_start_matches('\u{feff}');
+    match serde_json::from_str::<Saved>(text) {
+        Ok(s) => s,
+        Err(_) => {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let _ = std::fs::copy(&p, p.with_extension(format!("json.unreadable-{stamp}")));
+            Saved::default()
+        }
+    }
 }
 
 pub fn to_json(saved: &Saved) -> String {

@@ -1,4 +1,4 @@
-//! Racks: containers for VST3 plugins.
+﻿//! Racks: containers for VST3 plugins.
 //!
 //! A rack is a node in the signal graph. Routes can feed audio *into* it
 //! (sources -> rack) and take audio *out* of it (rack -> outputs / other racks).
@@ -22,6 +22,7 @@ use crate::vst3host::{Plugin, BLOCK, SAMPLE_RATE};
 
 /// Audio feeding into a rack from one route.
 struct Input {
+    #[allow(dead_code)] // kept for debugging which route feeds which input
     route: u64,
     ring: Arc<Ring>,
     gain: Arc<Gain>,
@@ -119,6 +120,13 @@ impl Rack {
     pub fn chain_info(&self) -> Vec<(String, bool, bool)> {
         self.chain.lock().unwrap().iter().map(|p| (p.desc.name.clone(), p.bypass, p.desc.is_instrument())).collect()
     }
+    /// What's loaded, in order, with bypass state (for saving).
+    pub fn chain_descs(&self) -> Vec<(crate::vst3host::PluginDesc, bool)> {
+        self.chain.lock().unwrap().iter().map(|p| (p.desc.clone(), p.bypass)).collect()
+    }
+    pub fn len(&self) -> usize {
+        self.chain.lock().unwrap().len()
+    }
     pub fn is_instrument(&self) -> bool {
         self.chain.lock().unwrap().first().is_some_and(|p| p.desc.is_instrument())
     }
@@ -177,9 +185,11 @@ impl Rack {
     pub fn attach_output(&self, route: u64, ring: Arc<Ring>) {
         self.outputs.lock().unwrap().push((route, ring));
     }
-    pub fn detach(&self, route: u64) {
-        self.inputs.lock().unwrap().retain(|i| i.route != route);
-        self.outputs.lock().unwrap().retain(|o| o.0 != route);
+    /// Unplug one route's buffer. Matched by the buffer itself, not the route
+    /// id: a reattached route keeps its id while old and new briefly overlap.
+    pub fn detach(&self, ring: &Arc<Ring>) {
+        self.inputs.lock().unwrap().retain(|i| !Arc::ptr_eq(&i.ring, ring));
+        self.outputs.lock().unwrap().retain(|o| !Arc::ptr_eq(&o.1, ring));
     }
 
     // ---- audio thread ----
@@ -232,7 +242,10 @@ impl Rack {
 
             // 2. Plugin chain. MIDI goes to every plugin (effects ignore it).
             let midi: Vec<[u8; 3]> = std::mem::take(&mut *self.midi.lock().unwrap());
-            if let Ok(mut chain) = self.chain.try_lock() {
+            // The UI only holds this lock for moments (swap, save state, open
+            // editor); waiting briefly is better than letting a dry block through.
+            {
+                let mut chain = self.chain.lock().unwrap();
                 if chain.first().is_some_and(|p| p.desc.is_instrument()) {
                     // Instruments make the sound; audio inputs are not used.
                     l.fill(0.0);
@@ -241,9 +254,6 @@ impl Rack {
                 for p in chain.iter_mut() {
                     p.process(&mut l, &mut r, &midi);
                 }
-            } else if !midi.is_empty() {
-                // Chain is being edited this instant: keep the MIDI for next block.
-                self.midi.lock().unwrap().splice(0..0, midi);
             }
 
             // 3. Send to every output.
