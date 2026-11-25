@@ -599,8 +599,11 @@ impl eframe::App for MagicMixer {
                     let dest = w.via.as_deref().map(app_label).unwrap_or_else(|| display_device(&names, &w.device_name));
                     ui.label(RichText::new(format!("{}  ->  {}", display_name(&names, &w.app), dest)).strong());
                     ui.add_space(10.0);
-                    let why = if w.find_app(&view.routable).is_none() {
-                        format!("Will connect when {} plays sound", app_label(&w.app))
+                    let is_device = !w.app.to_lowercase().ends_with(".exe") && w.app.contains(" (");
+                    let why = if w.find_app(&view.routable).is_none() && is_device {
+                        format!("Will connect when {} is plugged in", short_device(&w.app))
+                    } else if w.find_app(&view.routable).is_none() {
+                        format!("Will connect when {} plays sound", display_name(&names, &w.app))
                     } else {
                         format!("Waiting for {} to be plugged in", short_device(&w.device_name))
                     };
