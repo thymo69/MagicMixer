@@ -153,4 +153,4 @@ Build: `cargo build --release` (see Build and run above).
 - One VB-Cable is shared by every app recording from "CABLE Output".
 - MIDI from other apps needs the Windows MIDI Services preview.
 - No automated tests yet.
-- No license chosen yet; all rights reserved until one is added.
+- Licensed under the MIT License (see LICENSE).
