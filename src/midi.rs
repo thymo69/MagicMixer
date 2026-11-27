@@ -1,4 +1,4 @@
-//! MIDI (spike, midi-vst branch): list ports and prove messages flow through
+﻿//! MIDI (spike, midi-vst branch): list ports and prove messages flow through
 //! Windows MIDI Services' built-in loopback ports. Uses midir (WinMM backend),
 //! which Windows MIDI Services keeps compatible, so loopbacks and real
 //! controllers all show up here without loopMIDI.
@@ -51,4 +51,36 @@ pub fn loopback_test(send_to: &str, listen_on: &str) -> Result<Vec<Vec<u8>>, Str
     std::thread::sleep(Duration::from_millis(400));
     let received = got.lock().unwrap().clone();
     Ok(received)
+}
+
+/// The loopback pair other apps use to play Magic Mixer's instruments:
+/// apps send MIDI to `SEND_PORT`, racks listen on `LISTEN_PORT`.
+pub const SEND_PORT: &str = "Send to Magic Mixer";
+pub const LISTEN_PORT: &str = "Magic Mixer Listen";
+
+/// Make sure the loopback pair exists, creating it with Windows MIDI
+/// Services' console tool if needed (no admin rights required; the pair lasts
+/// until the MIDI service restarts, so this runs at every start).
+/// Returns a short status for the UI.
+pub fn ensure_loopback() -> String {
+    if list().is_ok_and(|p| p.inputs.iter().any(|n| n == LISTEN_PORT)) {
+        return "ready".into();
+    }
+    let tool = std::path::Path::new(r"C:\Program Files\Windows MIDI Services\Tools\midi.exe");
+    if !tool.exists() {
+        return "Windows MIDI Services Tools not installed".into();
+    }
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let ok = std::process::Command::new(tool)
+        .args(["loopback", "create", "--name-a", SEND_PORT, "--name-b", LISTEN_PORT])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .is_ok_and(|o| o.status.success());
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    if ok && list().is_ok_and(|p| p.inputs.iter().any(|n| n == LISTEN_PORT)) {
+        "created".into()
+    } else {
+        "couldn't create the loopback".into()
+    }
 }

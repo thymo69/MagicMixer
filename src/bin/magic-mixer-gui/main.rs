@@ -53,6 +53,8 @@ fn spawn_poller(ctx: egui::Context) -> Arc<Mutex<Snapshot>> {
         .name("poller".into())
         .spawn(move || {
             let _com = ComGuard::new();
+            // Ports other apps (Ableton etc.) use to play Magic Mixer's instruments.
+            let _ = magic_mixer::midi::ensure_loopback();
             let mut tick = 0u32;
             loop {
                 // The process list changes slowly; refresh it every ~1.5 s.

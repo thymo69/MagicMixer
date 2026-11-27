@@ -50,6 +50,7 @@ pub struct Racks {
     ctx: egui::Context,
     next_id: u64,
     last_state_save: Instant,
+    last_midi_retry: Instant,
     /// Last saved bytes per state file, to skip unchanged writes.
     state_cache: HashMap<String, u64>,
 }
@@ -76,6 +77,7 @@ impl Racks {
             ctx,
             next_id: 1,
             last_state_save: Instant::now(),
+            last_midi_retry: Instant::now(),
             state_cache: HashMap::new(),
         };
         racks.start_scan();
@@ -297,8 +299,19 @@ impl Racks {
         }
     }
 
-    /// Per frame: drop editors the user closed; save plugin settings now and then.
+    /// Per frame: drop editors the user closed; save plugin settings now and then;
+    /// reconnect MIDI inputs that weren't available yet (a keyboard plugged in
+    /// later, or the loopback created after start-up).
     pub fn tick(&mut self) {
+        if self.last_midi_retry.elapsed() > Duration::from_secs(3) {
+            self.last_midi_retry = Instant::now();
+            for ui in self.list.iter_mut().filter(|u| u.midi_in.is_some() && u.midi_conn.is_none()) {
+                let port = ui.midi_in.clone();
+                if set_midi(ui, port.clone()).is_err() {
+                    ui.midi_in = port; // keep waiting for it
+                }
+            }
+        }
         self.editors.retain(|_, ed| !ed.is_closed());
         if self.last_state_save.elapsed() > Duration::from_secs(60) {
             self.save_states();
@@ -508,13 +521,27 @@ impl Racks {
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("MIDI from").small());
-                        let current = rui.midi_in.clone().unwrap_or_else(|| "Nothing (keyboard below)".into());
+                        let current = match rui.midi_in.as_deref() {
+                            None => "Nothing (keyboard below)".to_string(),
+                            Some(magic_mixer::midi::LISTEN_PORT) => "Other apps (Ableton etc.)".to_string(),
+                            Some(p) => p.to_string(),
+                        };
                         egui::ComboBox::from_id_salt(("midi", id)).selected_text(current).show_ui(ui, |ui| {
                             if ui.selectable_label(rui.midi_in.is_none(), "Nothing").clicked() {
                                 actions.push(RackAction::SetMidi(None));
                             }
-                            for p in midi_ports {
-                                if ui.selectable_label(rui.midi_in.as_deref() == Some(p), p).clicked() {
+                            use magic_mixer::midi::{LISTEN_PORT, SEND_PORT};
+                            // The loopback first, with a plain-English label; its sending
+                            // side is for other apps, so it isn't offered here.
+                            let mut ports: Vec<&String> = midi_ports.iter().filter(|p| p.as_str() != SEND_PORT).collect();
+                            ports.sort_by_key(|p| p.as_str() != LISTEN_PORT);
+                            for p in ports {
+                                let label = if p == LISTEN_PORT { format!("Other apps (they send to \u{201C}{SEND_PORT}\u{201D})") } else { p.clone() };
+                                if ui
+                                    .selectable_label(rui.midi_in.as_deref() == Some(p.as_str()), label)
+                                    .on_hover_text(if p == LISTEN_PORT { "In Ableton (or any app), set the MIDI output to \u{201C}Send to Magic Mixer\u{201D}" } else { "A MIDI device" })
+                                    .clicked()
+                                {
                                     actions.push(RackAction::SetMidi(Some(p.clone())));
                                 }
                             }

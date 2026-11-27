@@ -49,6 +49,19 @@ copy of Magic Mixer runs at a time; opening it again shows the open window.
 
 Extra start-up connections: `magic-mixer-gui --connect "spotify=CABLE Input"` (repeatable).
 
+## Plugins (VST3)
+
+- **Plugin racks** hold a chain of VST3 plugins. Every plugin gets a quick
+  sound check when first scanned: does it *make* sound from MIDI, *change* the
+  audio sent into it, or *both*? Racks then sit in the matching lane:
+  Sources (makes sound), **Makes + changes sound**, or Effects.
+- Adding or swapping a plugin opens its own window; plugins without one get
+  Magic Mixer's slider window. Click a plugin's name to reopen it.
+- Instruments play from a MIDI keyboard, the on-screen keys, or **other apps**:
+  in Ableton (or any app) set the MIDI output to **"Send to Magic Mixer"**, and
+  in the rack choose *MIDI from: Other apps*. This loopback comes from
+  Windows MIDI Services Tools (preview); Magic Mixer recreates it at start-up.
+
 ## Command line (`magic-mixer.exe`)
 
 ```
