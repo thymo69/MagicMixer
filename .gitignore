@@ -1,1 +1,24 @@
+# Build output
 /target
+**/*.rs.bk
+*.pdb
+
+# Machine-specific cargo config (local target-dir path)
+/.cargo/config.toml
+
+# Logs and runtime data
+*.log
+connections.json
+plugin-cache.json
+
+# Secrets / local env
+.env
+.env.*
+*.pem
+*.key
+
+# Editor / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

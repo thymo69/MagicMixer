@@ -1,8 +1,40 @@
-﻿# Magic Mixer
+# Magic Mixer
 
 Per-app audio routing for Windows 10 (2004+) / 11. Send any app's sound to any
 output: your speakers, or a virtual cable (VB-Cable) that Discord, OBS or
 Ableton can record from.
+
+Version 0.1.0.
+
+## Features
+
+- Click-to-patch GUI: sources -> recording/effects apps -> outputs
+- Per-app capture (WASAPI process loopback), per-connection volume and mute
+- Microphones and other inputs as sources
+- Connections saved between runs and reconnected when an app reopens
+- VST3 plugin racks (instruments and effects), MIDI keyboard, on-screen keys,
+  MIDI from other apps
+- Command-line tool for scripting routes and setting the default device
+
+## Requirements
+
+- Windows 10 version 2004 or later, or Windows 11
+- [Rust](https://rustup.rs) (stable, MSVC toolchain) to build
+- [VB-CABLE](https://vb-audio.com/Cable/) to feed audio into another app
+  (Discord, OBS, Ableton)
+- Optional: Windows MIDI Services Tools (preview) for MIDI from other apps
+- Optional: VST3 plugins in `%CommonProgramFiles%\VST3`
+
+## Build and run
+
+```
+cargo build --release
+target\release\magic-mixer-gui.exe
+```
+
+Tip: to keep build output out of a synced folder such as OneDrive, add a
+local `.cargo/config.toml` with `[build] target-dir = "..."` (it is ignored
+by git).
 
 ## Install
 
@@ -85,13 +117,20 @@ magic-mixer default "Microphone Array"        # set the Windows default device
 | `src/ring.rs`              | FIFO joining capture to playback (latency capped 150 ms)  |
 | `src/com.rs`               | COM init, the shared 48 kHz stereo float format           |
 | `src/main.rs`              | CLI front end                                             |
-| `src/bin/magic-mixer-gui.rs` | GUI front end (egui)                                    |
+| `src/midi.rs`, `src/rack.rs`, `src/plugins.rs`, `src/vst3host.rs` | MIDI input, plugin racks, VST3 scan and hosting |
+| `src/bin/magic-mixer-gui/` | GUI front end (egui)                                    |
 
-Build: `cargo build --release`. Output goes to `%LOCALAPPDATA%\magic-mixer-target`
-(see `.cargo/config.toml`) to keep it out of OneDrive.
+Build: `cargo build --release` (see Build and run above).
 
 ## Known limits
 
 - "CABLE In 16ch" is hidden: it is the same VB-Cable as "CABLE Input", and the
   cable only accepts one of the two at a time.
-- Connections are not saved between runs yet.
+- Bluetooth headsets: when an app opens the headset's microphone, Windows
+  switches it to hands-free mode (low-quality mono audio). Use a separate
+  microphone to keep stereo playback.
+- Apps that use ASIO or exclusive mode can't be seen or captured per app.
+- One VB-Cable is shared by every app recording from "CABLE Output".
+- MIDI from other apps needs the Windows MIDI Services preview.
+- No automated tests yet.
+- No license chosen yet; all rights reserved until one is added.
