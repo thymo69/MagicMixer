@@ -10,7 +10,7 @@ use eframe::egui::{self, Color32, Rect, RichText, Sense, Stroke, Vec2};
 use magic_mixer::plugins::{self, PluginInfo};
 use magic_mixer::rack;
 use magic_mixer::saved::{self, SavedPlugin, SavedRack};
-use magic_mixer::vst3host::{Editor, Plugin, PluginDesc};
+use magic_mixer::vst3host::{Editor, ParamView, Plugin, PluginDesc};
 
 pub struct RackUi {
     pub id: u64,
@@ -30,13 +30,24 @@ pub enum RackAction {
     Add(PluginInfo),
     SetMidi(Option<String>),
     Delete,
+    /// Re-run the plugin scan + sound check from scratch.
+    Rescan,
+}
+
+/// A generic slider window for a plugin without its own GUI.
+struct GenericWin {
+    title: String,
+    params: Vec<ParamView>,
+    refreshed: Instant,
 }
 
 pub struct Racks {
     pub list: Vec<RackUi>,
     editors: HashMap<(u64, usize), Editor>,
+    generic: HashMap<(u64, usize), GenericWin>,
     /// Scan results (None while scanning).
     scanned: Arc<Mutex<Option<Vec<PluginInfo>>>>,
+    ctx: egui::Context,
     next_id: u64,
     last_state_save: Instant,
     /// Last saved bytes per state file, to skip unchanged writes.
@@ -57,21 +68,102 @@ fn hash(bytes: &[u8]) -> u64 {
 
 impl Racks {
     pub fn new(ctx: egui::Context) -> Racks {
-        let scanned: Arc<Mutex<Option<Vec<PluginInfo>>>> = Arc::default();
-        let s = scanned.clone();
-        // Scanning runs each plugin in a child process; keep it off the UI thread.
+        let racks = Racks {
+            list: Vec::new(),
+            editors: HashMap::new(),
+            generic: HashMap::new(),
+            scanned: Arc::default(),
+            ctx,
+            next_id: 1,
+            last_state_save: Instant::now(),
+            state_cache: HashMap::new(),
+        };
+        racks.start_scan();
+        racks
+    }
+
+    /// Scan plugins (each in a child process, with the sound check) off the UI thread.
+    fn start_scan(&self) {
+        *self.scanned.lock().unwrap() = None;
+        let (s, ctx) = (self.scanned.clone(), self.ctx.clone());
         std::thread::spawn(move || {
             let found: Vec<PluginInfo> = plugins::scan().into_iter().flatten().flatten().collect();
             *s.lock().unwrap() = Some(found);
             ctx.request_repaint();
         });
-        Racks {
-            list: Vec::new(),
-            editors: HashMap::new(),
-            scanned,
-            next_id: 1,
-            last_state_save: Instant::now(),
-            state_cache: HashMap::new(),
+    }
+
+    /// Show a plugin's own window if it has one, otherwise generic sliders.
+    fn open_slot(&mut self, id: u64, i: usize) -> Option<String> {
+        let r = rack::get(id)?;
+        if let Some(ed) = self.editors.get(&(id, i)) {
+            ed.focus();
+            return None;
+        }
+        let name = r.with_plugin(i, |p| p.desc.name.clone())?;
+        let title = format!("{name} \u{2014} {}", r.name());
+        let forced_generic = std::env::var_os("MM_FORCE_GENERIC").is_some();
+        let result = if forced_generic { Err("generic forced".to_string()) } else { r.with_plugin(i, |p| p.open_editor(&title))? };
+        match result {
+            Ok(ed) => {
+                self.editors.insert((id, i), ed);
+                None
+            }
+            Err(_) => {
+                // No window of its own: use Magic Mixer's generic controls.
+                let params = r.with_plugin(i, |p| p.params()).unwrap_or_default();
+                if params.is_empty() {
+                    return Some(format!("{name} has no window and no adjustable settings."));
+                }
+                self.generic.insert((id, i), GenericWin { title, params, refreshed: Instant::now() });
+                None
+            }
+        }
+    }
+
+    /// Draw generic parameter windows (plugins without their own GUI).
+    pub fn generic_windows(&mut self, ctx: &egui::Context) {
+        let mut closed = Vec::new();
+        for (&(id, i), win) in self.generic.iter_mut() {
+            let Some(r) = rack::get(id) else {
+                closed.push((id, i));
+                continue;
+            };
+            // Re-read values twice a second (the chain lock is only held briefly).
+            if win.refreshed.elapsed() > Duration::from_millis(500) {
+                if let Some(p) = r.with_plugin(i, |p| p.params()) {
+                    win.params = p;
+                }
+                win.refreshed = Instant::now();
+            }
+            let mut open = true;
+            egui::Window::new(&win.title)
+                .id(egui::Id::new(("generic", id, i)))
+                .open(&mut open)
+                .default_width(360.0)
+                .vscroll(true)
+                .show(ctx, |ui| {
+                    ui.label(RichText::new("This plugin has no window of its own, so here are its settings.").small().weak());
+                    egui::Grid::new(("gp", id, i)).num_columns(2).striped(true).show(ui, |ui| {
+                        for p in win.params.iter_mut() {
+                            ui.label(&p.title);
+                            let mut v = p.value;
+                            let slider = egui::Slider::new(&mut v, 0.0..=1.0).show_value(false).text(format!("{} {}", p.text, p.units));
+                            let slider = if p.steps > 0 { slider.step_by(1.0 / p.steps as f64) } else { slider };
+                            if ui.add(slider).changed() {
+                                p.value = v;
+                                r.with_plugin(i, |pl| pl.set_param(p.id, v));
+                            }
+                            ui.end_row();
+                        }
+                    });
+                });
+            if !open {
+                closed.push((id, i));
+            }
+        }
+        for k in closed {
+            self.generic.remove(&k);
         }
     }
 
@@ -122,26 +214,18 @@ impl Racks {
 
     fn close_editors(&mut self, id: u64) {
         self.editors.retain(|(r, _), _| *r != id);
+        self.generic.retain(|(r, _), _| *r != id);
     }
 
     /// Apply a card action. Returns a status message.
     pub fn apply(&mut self, id: u64, action: RackAction) -> Option<String> {
         let r = rack::get(id)?;
         match action {
-            RackAction::Open(i) => {
-                if let Some(ed) = self.editors.get(&(id, i)) {
-                    ed.focus();
-                    return None;
-                }
-                let title = format!("{} \u{2014} {}", r.with_plugin(i, |p| p.desc.name.clone()).unwrap_or_default(), r.name());
-                match r.with_plugin(i, |p| p.open_editor(&title)) {
-                    Some(Ok(ed)) => {
-                        self.editors.insert((id, i), ed);
-                        None
-                    }
-                    Some(Err(e)) => Some(format!("Couldn\u{2019}t open the plugin window: {e}")),
-                    None => None,
-                }
+            RackAction::Open(i) => self.open_slot(id, i),
+            RackAction::Rescan => {
+                plugins::clear_cache();
+                self.start_scan();
+                Some("Checking every plugin again (makes sound / changes sound / both)\u{2026}".into())
             }
             RackAction::Bypass(i, b) => {
                 r.set_bypass(i, b);
@@ -152,8 +236,10 @@ impl Racks {
                 match Plugin::load(&desc_of(&info), None) {
                     Ok(p) => {
                         self.editors.remove(&(id, i)); // close the old editor before the old plugin goes
+                        self.generic.remove(&(id, i));
                         let old = r.swap(i, p);
                         drop(old); // shut down here, on the UI thread
+                        self.open_slot(id, i);
                         Some(format!("Swapped in {} (sound kept playing)", info.name))
                     }
                     Err(e) => Some(format!("Couldn\u{2019}t load {}: {e}", info.name)),
@@ -171,7 +257,7 @@ impl Racks {
             }
             RackAction::Add(info) => match Plugin::load(&desc_of(&info), None) {
                 Ok(p) => {
-                    if p.desc.is_instrument() {
+                    let slot = if p.desc.is_instrument() {
                         // One instrument per rack, always first.
                         self.close_editors(id);
                         if r.is_instrument() {
@@ -179,10 +265,13 @@ impl Racks {
                         } else {
                             r.insert(0, p);
                         }
+                        0
                     } else {
                         r.push(p);
-                    }
-                    None
+                        r.len() - 1
+                    };
+                    // Show the plugin's own window right away (or generic sliders).
+                    self.open_slot(id, slot)
                 }
                 Err(e) => Some(format!("Couldn\u{2019}t load {}: {e}", info.name)),
             },
@@ -202,6 +291,7 @@ impl Racks {
     /// Close every editor and stop every rack, unloading plugins cleanly.
     pub fn shutdown(&mut self) {
         self.editors.clear();
+        self.generic.clear();
         for ui in std::mem::take(&mut self.list) {
             drop(rack::destroy(ui.id));
         }
@@ -276,7 +366,9 @@ impl Racks {
         let r = rack::get(id);
         let name = r.as_ref().map(|r| r.name()).unwrap_or_else(|| format!("Rack {id}"));
         let chain = r.as_ref().map(|r| r.chain_info()).unwrap_or_default();
-        let is_instrument = chain.first().is_some_and(|c| c.2);
+        let is_instrument = chain.first().is_some_and(|c| c.2 == "Instrument");
+        let makes_sound = chain.iter().any(|c| c.2 == "Instrument" || c.2 == "Both");
+        let lane = r.as_ref().map(|r| r.lane()).unwrap_or(rack::Lane::Changes);
         let scanned = self.scanned();
         let rui = self.list.iter_mut().find(|u| u.id == id);
         let Some(rui) = rui else {
@@ -310,10 +402,12 @@ impl Racks {
                     let t = ui.add(egui::Label::new(RichText::new(&name).strong().size(15.0)).sense(Sense::click()));
                     let tag = if chain.is_empty() {
                         "empty rack"
-                    } else if is_instrument {
-                        "instrument rack"
                     } else {
-                        "effects rack"
+                        match lane {
+                            rack::Lane::Makes => "makes sound",
+                            rack::Lane::MakeAndChange => "makes + changes sound",
+                            rack::Lane::Changes => "changes sound",
+                        }
                     };
                     ui.label(RichText::new(tag).small().color(visuals.weak_text_color()));
                     t
@@ -336,7 +430,8 @@ impl Racks {
                 if chain.is_empty() {
                     ui.label(RichText::new("Empty: sound passes straight through. Add a plugin below.").small().weak());
                 }
-                for (i, (pname, bypass, inst)) in chain.iter().enumerate() {
+                for (i, (pname, bypass, kind)) in chain.iter().enumerate() {
+                    let inst = &(kind == "Instrument");
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(format!("{}.", i + 1)).weak());
                         let label = RichText::new(pname).strong().color(if *bypass { visuals.weak_text_color() } else { visuals.text_color() });
@@ -353,7 +448,7 @@ impl Racks {
                                     ui.label("Scanning plugins\u{2026}");
                                 }
                                 Some(list) => {
-                                    for p in list.iter().filter(|p| (p.kind == "Instrument") == *inst && &p.name != pname) {
+                                    for p in list.iter().filter(|p| &p.kind == kind && &p.name != pname) {
                                         if ui.button(&p.name).clicked() {
                                             actions.push(RackAction::Swap(i, p.clone()));
                                             ui.close_menu();
@@ -380,22 +475,36 @@ impl Racks {
                         ui.label("No VST3 plugins found in Common Files\\VST3.");
                     }
                     Some(list) => {
-                        for (heading, kind) in [("INSTRUMENTS", "Instrument"), ("EFFECTS", "Effect")] {
+                        for (heading, kind) in [
+                            ("MAKES SOUND (instruments)", "Instrument"),
+                            ("CHANGES SOUND (effects)", "Effect"),
+                            ("MAKES + CHANGES SOUND", "Both"),
+                        ] {
+                            let items: Vec<&PluginInfo> = list.iter().filter(|p| p.kind == kind).collect();
+                            if items.is_empty() {
+                                continue;
+                            }
                             ui.label(RichText::new(heading).small().strong().weak());
-                            for p in list.iter().filter(|p| p.kind == kind) {
+                            for p in items {
                                 let label = format!("{}   {}", p.name, p.subcategories.replace('|', " \u{00B7} "));
-                                if ui.button(label).on_hover_text(&p.vendor).clicked() {
+                                let hover = format!("{} \u{2014} sound check: {}", p.vendor, if p.role.is_empty() { "not run" } else { &p.role });
+                                if ui.button(label).on_hover_text(hover).clicked() {
                                     actions.push(RackAction::Add(p.clone()));
                                     ui.close_menu();
                                 }
                             }
                             ui.add_space(4.0);
                         }
+                        ui.separator();
+                        if ui.button("Check all plugins again").on_hover_text("Re-run the makes / changes sound check").clicked() {
+                            actions.push(RackAction::Rescan);
+                            ui.close_menu();
+                        }
                     }
                 });
 
-                // Instruments: MIDI input and a mini keyboard.
-                if is_instrument {
+                // Anything that makes sound: MIDI input and a mini keyboard.
+                if makes_sound {
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("MIDI from").small());

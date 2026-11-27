@@ -675,6 +675,174 @@ impl Plugin {
         self.controller.is_some()
     }
 
+    /// The plugin's parameters with current values, for the generic editor
+    /// shown when a plugin has no window of its own. UI thread.
+    pub fn params(&self) -> Vec<ParamView> {
+        let Some(c) = &self.controller else { return Vec::new() };
+        let mut out = Vec::new();
+        unsafe {
+            let n = c.getParameterCount().min(256);
+            for i in 0..n {
+                let mut info: ParameterInfo = std::mem::zeroed();
+                if c.getParameterInfo(i, &mut info) != kResultOk {
+                    continue;
+                }
+                let flags = info.flags as i32;
+                if flags & (ParameterInfo_::ParameterFlags_::kIsReadOnly as i32) != 0
+                    || flags & (ParameterInfo_::ParameterFlags_::kIsHidden as i32) != 0
+                    || flags & (ParameterInfo_::ParameterFlags_::kIsProgramChange as i32) != 0
+                    || wstr(&info.title).starts_with("VST_ProgramChange")
+                {
+                    continue;
+                }
+                let value = c.getParamNormalized(info.id);
+                let mut s: String128 = [0; 128];
+                c.getParamStringByValue(info.id, value, &mut s);
+                out.push(ParamView {
+                    id: info.id,
+                    title: wstr(&info.title),
+                    units: wstr(&info.units),
+                    value,
+                    text: wstr(&s),
+                    steps: info.stepCount,
+                });
+            }
+        }
+        out
+    }
+
+    /// Set a parameter (normalized 0..1) from the generic editor. UI thread.
+    pub fn set_param(&self, id: u32, value: f64) {
+        if let Some(c) = &self.controller {
+            unsafe {
+                c.setParamNormalized(id, value);
+            }
+        }
+        self.pending.lock().unwrap().push((id, value));
+    }
+}
+
+/// One parameter, for the generic editor.
+#[derive(Debug, Clone)]
+pub struct ParamView {
+    pub id: u32,
+    pub title: String,
+    pub units: String,
+    pub value: f64,
+    pub text: String,
+    pub steps: i32,
+}
+
+fn wstr(s: &[TChar]) -> String {
+    let n = s.iter().position(|&c| c == 0).unwrap_or(s.len());
+    String::from_utf16_lossy(&s[..n].iter().map(|&c| c as u16).collect::<Vec<_>>())
+}
+
+/// What a plugin does with sound, measured by actually running it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SoundRole {
+    /// Makes sound from MIDI (an instrument).
+    Makes,
+    /// Changes the audio sent into it (an effect).
+    Changes,
+    /// Both: plays from MIDI and also processes incoming audio
+    /// (vocoders, samplers/synths with an audio input, MIDI-driven effects).
+    Both,
+    /// Neither test produced sound (e.g. a meter or analyzer).
+    Neither,
+}
+
+impl SoundRole {
+    pub fn as_kind(self) -> &'static str {
+        match self {
+            SoundRole::Makes => "Instrument",
+            SoundRole::Changes | SoundRole::Neither => "Effect",
+            SoundRole::Both => "Both",
+        }
+    }
+}
+
+fn rms_of(buf: &[f32]) -> f64 {
+    if buf.is_empty() {
+        return 0.0;
+    }
+    (buf.iter().map(|s| (*s as f64).powi(2)).sum::<f64>() / buf.len() as f64).sqrt()
+}
+
+/// Run `blocks` blocks: optional tone input and MIDI notes; returns output RMS.
+fn run_test(p: &mut Plugin, blocks: usize, tone: bool, notes: bool) -> f64 {
+    let mut out = Vec::with_capacity(blocks * BLOCK * 2);
+    for b in 0..blocks {
+        let mut l = vec![0f32; BLOCK];
+        let mut r = vec![0f32; BLOCK];
+        if tone {
+            for i in 0..BLOCK {
+                let t = (b * BLOCK + i) as f32 / SAMPLE_RATE as f32;
+                l[i] = 0.25 * (2.0 * std::f32::consts::PI * 440.0 * t).sin();
+                r[i] = l[i];
+            }
+        }
+        // A C-major chord on the first block (covers split/zoned instruments).
+        let midi: &[[u8; 3]] = if notes && b == 0 { &[[0x90, 48, 110], [0x90, 60, 110], [0x90, 64, 110], [0x90, 67, 110]] } else { &[] };
+        p.process(&mut l, &mut r, midi);
+        // Skip the first few blocks so start-up clicks don't count.
+        if b >= 4 {
+            out.extend_from_slice(&l);
+            out.extend_from_slice(&r);
+        }
+    }
+    rms_of(&out)
+}
+
+/// Decide whether a plugin makes sound, changes sound, or both, by running
+/// it on test signals (each test on a fresh instance so tails can't leak
+/// from one test into the next). Takes a few seconds; run it in a child
+/// process (the plugin scan does).
+pub fn sound_check(desc: &PluginDesc) -> Result<SoundRole, String> {
+    let blocks = (SAMPLE_RATE as usize * 6 / 10) / BLOCK; // ~0.6 s per test
+    let as_probe = PluginDesc { kind: "Both".into(), ..desc.clone() }; // never zero the input during tests
+
+    let mut p = Plugin::load(&as_probe, None)?;
+    let takes_audio = p.in_buses.first().is_some_and(|b| !b.channels.is_empty());
+    let takes_midi = p.has_events;
+    let base = run_test(&mut p, blocks, false, false);
+    drop(p);
+
+    let makes = if takes_midi {
+        let mut p = Plugin::load(&as_probe, None)?;
+        let e = run_test(&mut p, blocks, false, true);
+        e > (base * 4.0).max(1e-4)
+    } else {
+        false
+    };
+    let changes = if takes_audio {
+        let mut p = Plugin::load(&as_probe, None)?;
+        let e = run_test(&mut p, blocks, true, false);
+        e > (base * 4.0).max(1e-4)
+    } else {
+        false
+    };
+    Ok(match (makes, changes) {
+        (true, true) => SoundRole::Both,
+        (true, false) => SoundRole::Makes,
+        (false, true) => SoundRole::Changes,
+        (false, false) => SoundRole::Neither,
+    })
+}
+
+impl PluginDesc {
+    /// Makes sound from MIDI (instrument or both).
+    pub fn makes_sound(&self) -> bool {
+        self.kind == "Instrument" || self.kind == "Both"
+    }
+    /// Takes audio in (effect or both).
+    pub fn takes_audio(&self) -> bool {
+        self.kind == "Effect" || self.kind == "Both"
+    }
+}
+
+impl Plugin {
+
     /// Process one block in place (`l`, `r` are BLOCK frames or fewer).
     /// `midi` are raw 3-byte MIDI messages for this block.
     pub fn process(&mut self, l: &mut [f32], r: &mut [f32], midi: &[[u8; 3]]) {

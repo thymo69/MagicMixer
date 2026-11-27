@@ -55,7 +55,7 @@ pub struct Saved {
     pub hidden_devices: Vec<String>,
     /// Column widths as fractions (sources, middle, outputs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub columns: Option<[f32; 3]>,
+    pub columns: Option<Vec<f32>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]

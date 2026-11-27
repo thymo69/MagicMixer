@@ -117,8 +117,9 @@ impl Rack {
     // ---- chain editing (UI thread) ----
 
     /// Names of the plugins in the chain, with their bypass state.
-    pub fn chain_info(&self) -> Vec<(String, bool, bool)> {
-        self.chain.lock().unwrap().iter().map(|p| (p.desc.name.clone(), p.bypass, p.desc.is_instrument())).collect()
+    /// (name, bypassed, kind) for each plugin in order.
+    pub fn chain_info(&self) -> Vec<(String, bool, String)> {
+        self.chain.lock().unwrap().iter().map(|p| (p.desc.name.clone(), p.bypass, p.desc.kind.clone())).collect()
     }
     /// What's loaded, in order, with bypass state (for saving).
     pub fn chain_descs(&self) -> Vec<(crate::vst3host::PluginDesc, bool)> {
@@ -126,6 +127,25 @@ impl Rack {
     }
     pub fn len(&self) -> usize {
         self.chain.lock().unwrap().len()
+    }
+    /// Which lane the rack belongs in, from what its plugins do.
+    pub fn lane(&self) -> Lane {
+        let c = self.chain.lock().unwrap();
+        if c.iter().any(|p| p.desc.kind == "Both") {
+            Lane::MakeAndChange
+        } else if c.first().is_some_and(|p| p.desc.is_instrument()) {
+            Lane::Makes
+        } else {
+            Lane::Changes
+        }
+    }
+    /// Whether audio can be patched into this rack (not for pure instrument racks).
+    pub fn accepts_audio(&self) -> bool {
+        self.lane() != Lane::Makes
+    }
+    /// Whether anything in the rack plays from MIDI.
+    pub fn makes_sound(&self) -> bool {
+        self.chain.lock().unwrap().iter().any(|p| p.desc.makes_sound())
     }
     pub fn is_instrument(&self) -> bool {
         self.chain.lock().unwrap().first().is_some_and(|p| p.desc.is_instrument())
@@ -246,13 +266,22 @@ impl Rack {
             // editor); waiting briefly is better than letting a dry block through.
             {
                 let mut chain = self.chain.lock().unwrap();
-                if chain.first().is_some_and(|p| p.desc.is_instrument()) {
-                    // Instruments make the sound; audio inputs are not used.
-                    l.fill(0.0);
-                    r.fill(0.0);
-                }
-                for p in chain.iter_mut() {
+                // A pure instrument in front replaces the audio with its own sound;
+                // anything coming in is mixed back on top so later "make + change"
+                // plugins still receive it. (Pure instrument racks don't accept
+                // input connections, so for them this is just the instrument.)
+                let lead_instrument = chain.first().is_some_and(|p| p.desc.is_instrument());
+                let dry = lead_instrument.then(|| (l.clone(), r.clone()));
+                for (i, p) in chain.iter_mut().enumerate() {
                     p.process(&mut l, &mut r, &midi);
+                    if i == 0 {
+                        if let Some((dl, dr)) = &dry {
+                            for k in 0..BLOCK {
+                                l[k] += dl[k];
+                                r[k] += dr[k];
+                            }
+                        }
+                    }
                 }
             }
 
@@ -270,4 +299,14 @@ impl Rack {
             }
         }
     }
+}
+
+
+/// Where a rack is shown: with sources (makes sound), in the make + change
+/// lane, or with effects (changes sound).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lane {
+    Makes,
+    MakeAndChange,
+    Changes,
 }

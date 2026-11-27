@@ -1,4 +1,4 @@
-//! VST3 plugin discovery (spike, midi-vst branch).
+﻿//! VST3 plugin discovery (spike, midi-vst branch).
 //!
 //! Each plugin is probed in a *child process* (`magic-mixer probe-plugin
 //! <path>`), so a plugin that crashes or hangs while loading can never take
@@ -13,15 +13,19 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PluginInfo {
     pub path: PathBuf,
     pub name: String,
     pub vendor: String,
-    /// "Instrument" or "Effect".
+    /// "Instrument" (makes sound), "Effect" (changes sound) or "Both",
+    /// decided by the sound check (falls back to the declared category).
     pub kind: String,
     /// VST3 sub-categories, e.g. "Instrument|Synth" or "Fx|Delay".
     pub subcategories: String,
+    /// Result of the sound check in words, e.g. "makes sound".
+    #[serde(default)]
+    pub role: String,
 }
 
 /// All VST3 plugins in the standard folder (%CommonProgramFiles%\VST3).
@@ -57,10 +61,10 @@ pub fn binary_of(path: &Path) -> PathBuf {
     }
 }
 
-/// Probe every plugin, each in its own child process with a timeout.
-pub fn scan() -> Vec<Result<Vec<PluginInfo>, (PathBuf, String)>> {
+/// Probe plugins, each in its own child process with a timeout.
+fn probe_all(paths: Vec<PathBuf>) -> Vec<Result<Vec<PluginInfo>, (PathBuf, String)>> {
     let exe = std::env::current_exe().expect("current exe");
-    vst3_paths()
+    paths
         .into_iter()
         .map(|p| {
             let mut child = Command::new(&exe)
@@ -70,7 +74,8 @@ pub fn scan() -> Vec<Result<Vec<PluginInfo>, (PathBuf, String)>> {
                 .stderr(std::process::Stdio::piped())
                 .spawn()
                 .map_err(|e| (p.clone(), e.to_string()))?;
-            let deadline = Instant::now() + Duration::from_secs(20);
+            // Loading plus three short sound tests can take a while for big instruments.
+            let deadline = Instant::now() + Duration::from_secs(60);
             loop {
                 match child.try_wait() {
                     Ok(Some(_)) => break,
@@ -92,12 +97,13 @@ pub fn scan() -> Vec<Result<Vec<PluginInfo>, (PathBuf, String)>> {
                 .lines()
                 .filter_map(|l| {
                     let f: Vec<&str> = l.split('\t').collect();
-                    (f.len() == 4).then(|| PluginInfo {
+                    (f.len() >= 4).then(|| PluginInfo {
                         path: p.clone(),
                         name: f[0].into(),
                         vendor: f[1].into(),
                         kind: f[2].into(),
                         subcategories: f[3].into(),
+                        role: f.get(4).map(|s| s.to_string()).unwrap_or_default(),
                     })
                 })
                 .collect())
@@ -188,6 +194,7 @@ pub fn probe_in_process(path: &Path) -> Result<(), String> {
             return Err("plugin returned no factory".into());
         }
         let vt = &**(factory as *const *const FactoryVtbl);
+        let mut found: Vec<(String, String, String, String)> = Vec::new();
 
         let mut finfo: PFactoryInfo = std::mem::zeroed();
         (vt.get_factory_info)(factory, &mut finfo);
@@ -218,13 +225,31 @@ pub fn probe_in_process(path: &Path) -> Result<(), String> {
             }
             let kind = if subcats.to_lowercase().contains("instrument") { "Instrument" } else { "Effect" };
             let vendor = if vendor.is_empty() { factory_vendor.clone() } else { vendor };
-            println!("{name}\t{vendor}\t{kind}\t{subcats}");
+            found.push((name, vendor, kind.to_string(), subcats));
         }
         if has2 {
             let vt2 = &**(f2 as *const *const FactoryVtbl);
             (vt2.release)(f2);
         }
         (vt.release)(factory);
+
+        // Sound check: run each plugin on test signals to see whether it
+        // makes sound, changes sound, or both. Falls back to its declared
+        // category if the check can't run.
+        for (name, vendor, declared, subcats) in &found {
+            let desc = crate::vst3host::PluginDesc { path: path.to_path_buf(), name: name.clone(), kind: declared.clone() };
+            let (kind, role) = match crate::vst3host::sound_check(&desc) {
+                Ok(crate::vst3host::SoundRole::Neither) => (declared.as_str(), "no sound in tests"),
+                Ok(r) => (r.as_kind(), match r {
+                    crate::vst3host::SoundRole::Makes => "makes sound",
+                    crate::vst3host::SoundRole::Changes => "changes sound",
+                    _ => "makes and changes sound",
+                }),
+                Err(_) => (declared.as_str(), "check failed"),
+            };
+            println!("{name}\t{vendor}\t{kind}\t{subcats}\t{role}");
+        }
+
         if let Some(exit) = GetProcAddress(module, s!("ExitDll")) {
             let exit: unsafe extern "system" fn() -> bool = std::mem::transmute(exit);
             exit();
@@ -233,4 +258,74 @@ pub fn probe_in_process(path: &Path) -> Result<(), String> {
         // this process exits right after anyway.
     }
     Ok(())
+}
+
+
+// ---------------------------------------------------------------------------
+// Scan cache: the sound check takes seconds per plugin, so results are kept
+// in %APPDATA%\MagicMixer\plugin-cache.json and only redone when a plugin's
+// file changes (by size or modified time).
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct CacheEntry {
+    path: PathBuf,
+    stamp: String,
+    plugins: Vec<PluginInfo>,
+}
+
+fn cache_path() -> PathBuf {
+    crate::saved::path().with_file_name("plugin-cache.json")
+}
+
+fn stamp(path: &Path) -> String {
+    match std::fs::metadata(binary_of(path)) {
+        Ok(m) => {
+            let t = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
+            format!("{}-{}", m.len(), t)
+        }
+        Err(_) => String::new(),
+    }
+}
+
+/// All VST3 plugins with their sound-check results (cached).
+pub fn scan() -> Vec<Result<Vec<PluginInfo>, (PathBuf, String)>> {
+    let cache: Vec<CacheEntry> = std::fs::read_to_string(cache_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(s.trim_start_matches('\u{feff}')).ok())
+        .unwrap_or_default();
+    let paths = vst3_paths();
+    let mut results: Vec<(PathBuf, Option<Result<Vec<PluginInfo>, (PathBuf, String)>>)> = paths
+        .iter()
+        .map(|p| {
+            let st = stamp(p);
+            let hit = cache.iter().find(|c| &c.path == p && c.stamp == st && !st.is_empty());
+            (p.clone(), hit.map(|c| Ok(c.plugins.clone())))
+        })
+        .collect();
+    let todo: Vec<PathBuf> = results.iter().filter(|r| r.1.is_none()).map(|r| r.0.clone()).collect();
+    let mut fresh = probe_all(todo.clone()).into_iter();
+    for r in results.iter_mut().filter(|r| r.1.is_none()) {
+        r.1 = fresh.next();
+    }
+    // Save successful results.
+    let entries: Vec<CacheEntry> = results
+        .iter()
+        .filter_map(|(p, r)| match r {
+            Some(Ok(list)) => Some(CacheEntry { path: p.clone(), stamp: stamp(p), plugins: list.clone() }),
+            _ => None,
+        })
+        .collect();
+    if let Ok(json) = serde_json::to_string_pretty(&entries) {
+        if let Some(dir) = cache_path().parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(cache_path(), json);
+    }
+    results.into_iter().filter_map(|(_, r)| r).collect()
+}
+
+/// Forget cached results so the next scan re-checks every plugin.
+pub fn clear_cache() {
+    let _ = std::fs::remove_file(cache_path());
 }

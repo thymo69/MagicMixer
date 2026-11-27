@@ -209,7 +209,7 @@ fn cmd_plugins() -> Res {
         match r {
             Ok(list) => {
                 for p in list {
-                    println!("  {:<10} {:<22} {:<12} {}", p.kind, p.name, p.vendor, p.subcategories);
+                    println!("  {:<10} {:<22} {:<12} {:<22} sound check: {}", p.kind, p.name, p.vendor, p.subcategories, p.role);
                 }
             }
             Err((path, e)) => println!("  FAILED     {}  ({e})", path.display()),

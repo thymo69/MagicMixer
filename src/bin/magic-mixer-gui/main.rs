@@ -218,7 +218,7 @@ struct MagicMixer {
     /// VST plugin racks.
     racks: racks_ui::Racks,
     /// Column widths as fractions (sources, middle, outputs).
-    col_frac: [f32; 3],
+    col_frac: [f32; 4],
     /// Device names hidden from the columns.
     hidden: Vec<String>,
     show_hidden: bool,
@@ -232,7 +232,10 @@ impl MagicMixer {
         let mut racks = racks_ui::Racks::new(cc.egui_ctx.clone());
         let rack_errors = racks.restore(&saved.racks);
         let status = (!rack_errors.is_empty()).then(|| format!("Some plugins didn\u{2019}t load: {}", rack_errors.join("; ")));
-        let col_frac = saved.columns.unwrap_or([1.0 / 3.0; 3]);
+        let col_frac = match saved.columns.as_deref() {
+            Some(&[a, b, c, d]) => [a, b, c, d],
+            _ => [0.25; 4], // first run, or saved by the 3-column version
+        };
         let hidden = saved.hidden_devices.clone();
         let mut waiting = saved.connections;
         for c in extra {
@@ -385,7 +388,7 @@ impl MagicMixer {
             source_apps: self.source_apps.clone(),
             racks: self.racks.saved(),
             hidden_devices: self.hidden.clone(),
-            columns: Some(self.col_frac),
+            columns: Some(self.col_frac.to_vec()),
         };
         let json = saved::to_json(&state);
         if json != self.last_saved {
@@ -517,6 +520,7 @@ impl eframe::App for MagicMixer {
             view.all_outputs.push(rack::as_output(r.id));
         }
         self.racks.tick();
+        self.racks.generic_windows(ctx);
         let names = self.rack_names();
         if loaded {
             if !self.waiting.is_empty() {
@@ -660,8 +664,8 @@ impl eframe::App for MagicMixer {
 
             let gap = 70.0;
             // Leave room for the gaps plus egui's spacing between items (and the scrollbar).
-            let avail = (ui.available_width() - 2.0 * gap - 4.0 * ui.spacing().item_spacing.x - 16.0).max(450.0);
-            let col_ws = self.col_frac.map(|f| (avail * f).max(150.0));
+            let avail = (ui.available_width() - 3.0 * gap - 6.0 * ui.spacing().item_spacing.x - 16.0).max(600.0);
+            let col_ws = self.col_frac.map(|f| (avail * f).max(140.0));
             let selected_is_source = self.selected.is_some_and(|p| {
                 view.sources.iter().any(|s| s.pid == p) || self.racks.list.iter().any(|r| rack::as_source(r.id).pid == p)
             });
@@ -674,6 +678,31 @@ impl eframe::App for MagicMixer {
             let is_hidden = |name: &str| hidden.iter().any(|h| h == name);
 
             egui::ScrollArea::vertical().show(ui, |ui| {
+                // Draw the plugin racks that belong in one lane.
+                macro_rules! rack_cards {
+                    ($ui:expr, $lane:expr) => {
+                        let ids: Vec<u64> = racks
+                            .list
+                            .iter()
+                            .map(|r| r.id)
+                            .filter(|id| rack::get(*id).map(|r| r.lane()) == Some($lane))
+                            .collect();
+                        for id in ids {
+                            let src_pid = rack::as_source(id).pid;
+                            let rid = format!("rack:{id}");
+                            let accent = routes.iter().find(|r| r.output.id == rid).map(|r| cable_color(r.id)).or_else(|| color_from(src_pid));
+                            let (title, rect, acts) = racks.card($ui, id, self.selected == Some(src_pid), accent, &midi_ports);
+                            let y = title.rect.center().y;
+                            dev_anchor.insert(rid, Pos2::new(rect.left(), y));
+                            out_anchor.insert(src_pid, Pos2::new(rect.right(), y));
+                            if title.clicked() {
+                                click = Some(Click::Rack(id));
+                            }
+                            rack_actions.extend(acts.into_iter().map(|a| (id, a)));
+                            $ui.add_space(4.0);
+                        }
+                    };
+                }
                 let cols = ui.horizontal_top(|ui| {
                     let col_w = col_ws[0];
                     // ---- Column 1: sources ----
@@ -733,13 +762,33 @@ impl eframe::App for MagicMixer {
                         }
                         ui.add_space(6.0);
                         ui.label(RichText::new("Don\u{2019}t see your app? Play something in it.").small().weak());
+                        // Instrument racks make sound, so they live with the sources.
+                        ui.add_space(10.0);
+                        rack_cards!(ui, rack::Lane::Makes);
                     });
 
                     ui.add_space(gap);
 
-                    // ---- Column 2: recording / effects apps, plugin racks ----
+                    // ---- Column 2: plugins that make AND change sound ----
                     ui.vertical(|ui| {
                         ui.set_width(col_ws[1]);
+                        column_header(ui, "MAKES + CHANGES SOUND", "Plugins that play and process");
+                        let any = racks.list.iter().any(|r| rack::get(r.id).is_some_and(|r| r.lane() == rack::Lane::MakeAndChange));
+                        if !any {
+                            ui.label(
+                                RichText::new("Racks with a plugin that both plays from MIDI and processes incoming audio (vocoders, synths with an audio input) appear here.")
+                                    .small()
+                                    .weak(),
+                            );
+                        }
+                        rack_cards!(ui, rack::Lane::MakeAndChange);
+                    });
+
+                    ui.add_space(gap);
+
+                    // ---- Column 3: recording / effects apps, effect racks ----
+                    ui.vertical(|ui| {
+                        ui.set_width(col_ws[2]);
                         column_header(ui, "RECORDING / EFFECTS APPS", "Ableton, Discord, OBS\u{2026}");
                         if loaded && view.middle.is_empty() {
                             ui.label(
@@ -792,28 +841,11 @@ impl eframe::App for MagicMixer {
                             ui.add_space(4.0);
                         }
 
-                        // Plugin racks (VST containers).
+                        // Plugin racks that change sound (new/empty racks start here and
+                        // move lanes by themselves once their plugins are known).
                         ui.add_space(10.0);
-                        column_header(ui, "PLUGIN RACKS", "VST instruments and effects");
-                        let ids: Vec<u64> = racks.list.iter().map(|r| r.id).collect();
-                        for id in ids {
-                            let src_pid = rack::as_source(id).pid;
-                            let rid = format!("rack:{id}");
-                            let accent = routes
-                                .iter()
-                                .find(|r| r.output.id == rid)
-                                .map(|r| cable_color(r.id))
-                                .or_else(|| color_from(src_pid));
-                            let (title, rect, acts) = racks.card(ui, id, self.selected == Some(src_pid), accent, &midi_ports);
-                            let y = title.rect.center().y;
-                            dev_anchor.insert(rid, Pos2::new(rect.left(), y));
-                            out_anchor.insert(src_pid, Pos2::new(rect.right(), y));
-                            if title.clicked() {
-                                click = Some(Click::Rack(id));
-                            }
-                            rack_actions.extend(acts.into_iter().map(|a| (id, a)));
-                            ui.add_space(4.0);
-                        }
+                        column_header(ui, "PLUGIN RACKS", "VST plugins; racks move to the lane that fits");
+                        rack_cards!(ui, rack::Lane::Changes);
                         if ui.button("+ New plugin rack").on_hover_text("A container for VST instruments and effects").clicked() {
                             new_rack = true;
                         }
@@ -821,9 +853,9 @@ impl eframe::App for MagicMixer {
 
                     ui.add_space(gap);
 
-                    // ---- Column 3: outputs ----
+                    // ---- Column 4: outputs ----
                     ui.vertical(|ui| {
-                        ui.set_width(col_ws[2]);
+                        ui.set_width(col_ws[3]);
                         column_header(ui, "OUTPUTS", "Speakers, headphones, cables");
                         for d in &view.outputs {
                             let hid = is_hidden(&d.name);
@@ -865,7 +897,7 @@ impl eframe::App for MagicMixer {
                 // ---- Column splitters: drag to resize ----
                 let area = cols.response.rect;
                 let mut x = area.left();
-                for i in 0..2 {
+                for i in 0..3 {
                     x += col_ws[i] + gap / 2.0;
                     let handle = Rect::from_min_max(Pos2::new(x - 5.0, area.top()), Pos2::new(x + 5.0, area.bottom()));
                     let resp = ui.interact(handle, ui.id().with(("split", i)), Sense::drag());
@@ -885,7 +917,7 @@ impl eframe::App for MagicMixer {
                         }
                     }
                     if resp.double_clicked() {
-                        *col_frac = [1.0 / 3.0; 3];
+                        *col_frac = [0.25; 4];
                     }
                     x += gap / 2.0;
                 }
@@ -979,7 +1011,7 @@ impl eframe::App for MagicMixer {
                 let name = self.racks.name(id);
                 match selected_src.clone() {
                     Some(src) if src.pid != src_pid => {
-                        if rack::get(id).is_some_and(|r| r.is_instrument()) {
+                        if rack::get(id).is_some_and(|r| !r.accepts_audio()) {
                             self.status = Some(format!(
                                 "{name} is an instrument rack: it\u{2019}s played by MIDI. Click it first to send its sound somewhere."
                             ));
