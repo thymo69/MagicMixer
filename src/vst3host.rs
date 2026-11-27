@@ -120,6 +120,9 @@ impl IAttributeListTrait for Attributes {
         }
     }
     unsafe fn setString(&self, id: AttrID, string: *const TChar) -> tresult {
+        if string.is_null() {
+            return kResultFalse;
+        }
         let mut v = Vec::new();
         let mut p = string;
         while *p != 0 {
@@ -131,6 +134,7 @@ impl IAttributeListTrait for Attributes {
     }
     unsafe fn getString(&self, id: AttrID, string: *mut TChar, size_in_bytes: uint32) -> tresult {
         match self.map.lock().unwrap().get(&key(id)) {
+            Some(AttrVal::Str(_)) if string.is_null() || size_in_bytes < 2 => kResultFalse,
             Some(AttrVal::Str(v)) => {
                 let max = (size_in_bytes as usize / 2).saturating_sub(1);
                 let n = v.len().min(max);
@@ -144,7 +148,11 @@ impl IAttributeListTrait for Attributes {
         }
     }
     unsafe fn setBinary(&self, id: AttrID, data: *const c_void, size_in_bytes: uint32) -> tresult {
-        let v = std::slice::from_raw_parts(data as *const u8, size_in_bytes as usize).to_vec();
+        let v = if data.is_null() || size_in_bytes == 0 {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(data as *const u8, size_in_bytes as usize).to_vec()
+        };
         self.map.lock().unwrap().insert(key(id), AttrVal::Bin(v));
         kResultOk
     }
@@ -203,6 +211,9 @@ impl IBStreamTrait for MemStream {
         let mut g = self.inner.lock().unwrap();
         let (data, pos) = &mut *g;
         let n = (num_bytes.max(0) as usize).min(data.len().saturating_sub(*pos));
+        if n > 0 && buffer.is_null() {
+            return kResultFalse;
+        }
         std::ptr::copy_nonoverlapping(data.as_ptr().add(*pos), buffer as *mut u8, n);
         *pos += n;
         if !read.is_null() {
@@ -214,6 +225,9 @@ impl IBStreamTrait for MemStream {
         let mut g = self.inner.lock().unwrap();
         let (data, pos) = &mut *g;
         let n = num_bytes.max(0) as usize;
+        if n > 0 && buffer.is_null() {
+            return kResultFalse;
+        }
         let end = *pos + n;
         if data.len() < end {
             data.resize(end, 0);

@@ -25,6 +25,26 @@ Version 0.1.0.
 - Optional: Windows MIDI Services Tools (preview) for MIDI from other apps
 - Optional: VST3 plugins in `%CommonProgramFiles%\VST3`
 
+## Dependencies
+
+Rust crates (from `Cargo.toml`):
+
+| crate | used for |
+|---|---|
+| [windows](https://crates.io/crates/windows) ([docs](https://docs.rs/windows)) | WASAPI audio, COM, Win32 APIs |
+| [windows-core](https://crates.io/crates/windows-core) ([docs](https://docs.rs/windows-core)) | COM interface implementation |
+| [eframe](https://crates.io/crates/eframe) ([docs](https://docs.rs/eframe)) | GUI (egui) |
+| [serde](https://crates.io/crates/serde) ([docs](https://docs.rs/serde)) | saved connections and plugin cache |
+| [serde_json](https://crates.io/crates/serde_json) ([docs](https://docs.rs/serde_json)) | JSON format for those files |
+| [midir](https://crates.io/crates/midir) ([docs](https://docs.rs/midir)) | MIDI input |
+| [vst3](https://crates.io/crates/vst3) ([docs](https://docs.rs/vst3)) | VST3 interface definitions |
+
+External:
+
+- [VB-CABLE Virtual Audio Device](https://vb-audio.com/Cable/) (donationware), to send audio into another app
+- [Windows MIDI Services](https://github.com/microsoft/MIDI/releases) (preview Tools), for MIDI from other apps
+- [Rust toolchain](https://rustup.rs)
+
 ## Build and run
 
 ```
